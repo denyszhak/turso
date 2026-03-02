@@ -1016,7 +1016,7 @@ impl Program {
                 program: prepared, ..
             } = insn
             {
-                Some(prepared.clone())
+                prepared.resolve().ok()
             } else {
                 None
             };
@@ -1032,7 +1032,7 @@ impl Program {
                 program: prepared, ..
             } = insn
             {
-                Some(prepared.clone())
+                prepared.resolve().ok()
             } else {
                 None
             };

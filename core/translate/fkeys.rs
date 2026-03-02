@@ -3,13 +3,13 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
-    connection::FkActionCompileKey,
+    connection::{FkActionCompileKey, FkCompilationStart},
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, QueryMode},
-        insn::{CmpInsFlags, Insn},
+        insn::{CmpInsFlags, Insn, SubprogramRef},
         BranchOffset,
     },
     Connection, LimboError, Result, Value,
@@ -1269,6 +1269,26 @@ fn fk_action_compile_key(
     key_ctor(Arc::as_ptr(&fk_ref.fk) as usize)
 }
 
+/// Build the params vector from an FK action context.
+fn build_fk_action_params(ctx: &FkActionContext) -> Vec<Value> {
+    let mut params: Vec<Value> = ctx
+        .old_key_registers
+        .iter()
+        .copied()
+        .map(|reg_idx| Value::from_i64(reg_idx as i64))
+        .collect();
+
+    if let Some(new_regs) = &ctx.new_key_registers {
+        params.extend(
+            new_regs
+                .iter()
+                .copied()
+                .map(|reg_idx| Value::from_i64(reg_idx as i64)),
+        );
+    }
+    params
+}
+
 /// Compile and emit an FK action as a sub-program.
 /// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.
 fn emit_fk_action_subprogram(
@@ -1280,7 +1300,21 @@ fn emit_fk_action_subprogram(
     ctx: &FkActionContext,
     description: &'static str,
 ) -> Result<()> {
-    connection.start_fk_action_compilation(compile_key)?;
+    match connection.start_fk_action_compilation(compile_key)? {
+        FkCompilationStart::CycleDetected(deferred_slot) => {
+            // Self-referential FK — emit deferred Program opcode.
+            let params = build_fk_action_params(ctx);
+            let ignore_jump_target = program.allocate_label();
+            program.emit_insn(Insn::Program {
+                params,
+                program: SubprogramRef::Deferred(deferred_slot),
+                ignore_jump_target,
+            });
+            program.preassign_label_to_next_insn(ignore_jump_target);
+            return Ok(());
+        }
+        FkCompilationStart::Proceed => {}
+    }
 
     let build_subprogram_result = (|| -> Result<_> {
         let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
@@ -1304,29 +1338,21 @@ fn emit_fk_action_subprogram(
 
     let built_subprogram = build_subprogram_result?;
 
-    // Build params: OLD key register indices, then optionally NEW key register indices
-    let mut params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::from_i64(reg_idx as i64))
-        .collect();
-
-    if let Some(new_regs) = &ctx.new_key_registers {
-        params.extend(
-            new_regs
-                .iter()
-                .copied()
-                .map(|reg_idx| Value::from_i64(reg_idx as i64)),
-        );
+    // Fill deferred slot if inner compilation created one for this key.
+    // Use Arc::downgrade to store a Weak reference, breaking the reference cycle.
+    if let Some(slot) = connection.take_fk_action_deferred_slot(&compile_key) {
+        slot.set(Arc::downgrade(built_subprogram.prepared()))
+            .expect("deferred FK subprogram slot already filled");
     }
+
+    let params = build_fk_action_params(ctx);
 
     // FK action subprograms can't contain RAISE(IGNORE), so ignore_jump_target
     // is a no-op that resolves to the next instruction (just falls through).
     let ignore_jump_target = program.allocate_label();
     program.emit_insn(Insn::Program {
         params,
-        program: built_subprogram.prepared().clone(),
+        program: SubprogramRef::Ready(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
     program.preassign_label_to_next_insn(ignore_jump_target);

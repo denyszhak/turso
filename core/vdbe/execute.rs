@@ -2902,7 +2902,7 @@ pub fn op_program(
         match &mut state.op_program_state {
             OpProgramState::Start => {
                 let mut statement = Statement::new(
-                    Program::from_prepared(subprogram.clone(), program.connection.clone()),
+                    Program::from_prepared(subprogram.resolve()?, program.connection.clone()),
                     pager.clone(),
                     QueryMode::Normal,
                 );

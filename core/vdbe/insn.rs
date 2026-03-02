@@ -3,6 +3,39 @@ use std::{
     sync::Arc,
 };
 
+/// A reference to a compiled subprogram used in `Insn::Program`.
+///
+/// `Ready` is the normal case where the subprogram is available at compile time.
+/// `Deferred` is used for self-referential FK cascades where the subprogram
+/// references itself. Uses `Weak` to avoid an Arc reference cycle (the parent
+/// program holds the strong `Arc`; the self-referencing instruction inside the
+/// subprogram holds only a `Weak` back-pointer).
+#[derive(Debug, Clone)]
+pub enum SubprogramRef {
+    Ready(Arc<PreparedProgram>),
+    Deferred(crate::connection::DeferredSubprogramSlot),
+}
+
+impl SubprogramRef {
+    pub fn resolve(&self) -> crate::Result<Arc<PreparedProgram>> {
+        match self {
+            SubprogramRef::Ready(p) => Ok(p.clone()),
+            SubprogramRef::Deferred(slot) => {
+                let weak = slot.get().ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "deferred subprogram ref not initialized".into(),
+                    )
+                })?;
+                weak.upgrade().ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "deferred subprogram ref expired (parent dropped)".into(),
+                    )
+                })
+            }
+        }
+    }
+}
+
 /// Convert a usize to u16 for instruction fields (registers, counts).
 /// Panics if the value exceeds u16::MAX.
 #[inline]
@@ -618,7 +651,7 @@ pub enum Insn {
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
         params: Vec<Value>,
-        program: Arc<PreparedProgram>,
+        program: SubprogramRef,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
         ignore_jump_target: BranchOffset,

@@ -54,6 +54,20 @@ pub(crate) enum FkActionCompileKey {
     UpdateSetDefault(usize),
 }
 
+/// A deferred slot that will be filled with a `Weak` back-pointer once the
+/// self-referential subprogram finishes building.
+pub(crate) type DeferredSubprogramSlot = Arc<std::sync::OnceLock<std::sync::Weak<crate::PreparedProgram>>>;
+
+/// Result of `start_fk_action_compilation`.
+pub(crate) enum FkCompilationStart {
+    /// No cycle — proceed with normal compilation.
+    Proceed,
+    /// Cycle detected — use this deferred slot for the self-referencing Program opcode.
+    /// Contains a `Weak`-based slot: the parent holds the strong `Arc`, the self-ref
+    /// instruction stores only a `Weak` to break the reference cycle.
+    CycleDetected(DeferredSubprogramSlot),
+}
+
 /// Database connection handle.
 ///
 /// # Compile-Affecting Fields
@@ -141,6 +155,11 @@ pub struct Connection {
     /// Current FK action subprogram compilation depth.
     /// Self-referential and cyclic CASCADE actions recursively compile nested subprograms.
     pub(super) compiling_fk_actions_depth: AtomicI32,
+    /// Deferred subprogram slot for self-referential FK cascades.
+    /// Created when a cycle is detected, filled after the outer subprogram builds.
+    /// At most one self-referential cycle can be in-flight at a time during compilation.
+    pub(super) fk_action_deferred_slot:
+        RwLock<Option<(FkActionCompileKey, DeferredSubprogramSlot)>>,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -241,7 +260,10 @@ impl Connection {
         );
     }
 
-    pub(crate) fn start_fk_action_compilation(&self, key: FkActionCompileKey) -> Result<()> {
+    pub(crate) fn start_fk_action_compilation(
+        &self,
+        key: FkActionCompileKey,
+    ) -> Result<FkCompilationStart> {
         let depth = self
             .compiling_fk_actions_depth
             .fetch_add(1, Ordering::SeqCst)
@@ -260,13 +282,33 @@ impl Connection {
         if compiling_fk_actions.iter().any(|active| active == &key) {
             self.compiling_fk_actions_depth
                 .fetch_sub(1, Ordering::SeqCst);
-            return Err(LimboError::ParseError(
-                "too many levels of trigger recursion".to_string(),
-            ));
+            // Cycle detected — return a deferred slot instead of erroring.
+            let mut slot_guard = self.fk_action_deferred_slot.write();
+            let slot = match slot_guard.as_ref() {
+                Some((k, s)) if *k == key => s.clone(),
+                _ => {
+                    let s = Arc::new(std::sync::OnceLock::new());
+                    *slot_guard = Some((key, s.clone()));
+                    s
+                }
+            };
+            return Ok(FkCompilationStart::CycleDetected(slot));
         }
         compiling_fk_actions.push(key);
 
-        Ok(())
+        Ok(FkCompilationStart::Proceed)
+    }
+
+    /// Retrieve and remove the deferred slot after the outer subprogram finishes building.
+    pub(crate) fn take_fk_action_deferred_slot(
+        &self,
+        key: &FkActionCompileKey,
+    ) -> Option<DeferredSubprogramSlot> {
+        let mut slot_guard = self.fk_action_deferred_slot.write();
+        match slot_guard.as_ref() {
+            Some((k, _)) if k == key => slot_guard.take().map(|(_, s)| s),
+            _ => None,
+        }
     }
 
     pub(crate) fn end_fk_action_compilation(&self, expected_key: FkActionCompileKey) {

@@ -411,6 +411,11 @@ impl CompiledExpression {
                         crate::vdbe::execute::InsnFunctionStepResult::Step => {
                             pc = state.pc as usize;
                         }
+                        crate::vdbe::execute::InsnFunctionStepResult::SpawnedSubprogram => {
+                            return Err(crate::LimboError::InternalError(
+                                "Expression evaluation spawned unexpected subprogram".to_string(),
+                            ));
+                        }
                     }
                 }
 

@@ -1301,13 +1301,14 @@ fn emit_fk_action_subprogram(
     description: &'static str,
 ) -> Result<()> {
     match connection.start_fk_action_compilation(compile_key)? {
-        FkCompilationStart::CycleDetected(deferred_slot) => {
-            // Self-referential FK — emit deferred Program opcode.
+        FkCompilationStart::CycleDetected(backpatch) => {
+            // Recursive FK graph — emit a Program opcode that will be backpatched
+            // once the target subprogram finishes building.
             let params = build_fk_action_params(ctx);
             let ignore_jump_target = program.allocate_label();
             program.emit_insn(Insn::Program {
                 params,
-                program: SubprogramRef::Deferred(deferred_slot),
+                program: SubprogramRef::Backpatch(backpatch),
                 ignore_jump_target,
             });
             program.preassign_label_to_next_insn(ignore_jump_target);
@@ -1334,16 +1335,15 @@ fn emit_fk_action_subprogram(
         subprogram_builder.build(connection.clone(), true, description)
     })();
 
-    connection.end_fk_action_compilation(compile_key);
+    let backpatch = connection.end_fk_action_compilation(compile_key);
 
     let built_subprogram = build_subprogram_result?;
 
-    // Fill deferred slot if inner compilation created one for this key.
-    // Use Arc::downgrade to store a Weak reference, breaking the reference cycle.
-    if let Some(slot) = connection.take_fk_action_deferred_slot(&compile_key) {
-        slot.set(Arc::downgrade(built_subprogram.prepared()))
-            .expect("deferred FK subprogram slot already filled");
-    }
+    // Patch any recursive references to this in-flight subprogram now that the
+    // final prepared program exists. Use a Weak reference to avoid ownership cycles.
+    backpatch
+        .set(Arc::downgrade(built_subprogram.prepared()))
+        .expect("FK subprogram backpatch already filled");
 
     let params = build_fk_action_params(ctx);
 

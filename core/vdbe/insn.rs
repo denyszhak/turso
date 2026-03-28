@@ -6,29 +6,26 @@ use std::{
 /// A reference to a compiled subprogram used in `Insn::Program`.
 ///
 /// `Ready` is the normal case where the subprogram is available at compile time.
-/// `Deferred` is used for self-referential FK cascades where the subprogram
-/// references itself. Uses `Weak` to avoid an Arc reference cycle (the parent
-/// program holds the strong `Arc`; the self-referencing instruction inside the
-/// subprogram holds only a `Weak` back-pointer).
+/// `Backpatch` is used for recursive FK action graphs. The handle is patched
+/// after the target subprogram finishes building and resolves through a `Weak`
+/// reference so cycles do not create `Arc` leaks.
 #[derive(Debug, Clone)]
 pub enum SubprogramRef {
     Ready(Arc<PreparedProgram>),
-    Deferred(crate::connection::DeferredSubprogramSlot),
+    Backpatch(crate::connection::SubprogramBackpatch),
 }
 
 impl SubprogramRef {
     pub fn resolve(&self) -> crate::Result<Arc<PreparedProgram>> {
         match self {
             SubprogramRef::Ready(p) => Ok(p.clone()),
-            SubprogramRef::Deferred(slot) => {
-                let weak = slot.get().ok_or_else(|| {
-                    crate::LimboError::InternalError(
-                        "deferred subprogram ref not initialized".into(),
-                    )
+            SubprogramRef::Backpatch(handle) => {
+                let weak = handle.get().ok_or_else(|| {
+                    crate::LimboError::InternalError("subprogram backpatch not initialized".into())
                 })?;
                 weak.upgrade().ok_or_else(|| {
                     crate::LimboError::InternalError(
-                        "deferred subprogram ref expired (parent dropped)".into(),
+                        "subprogram backpatch expired (parent dropped)".into(),
                     )
                 })
             }

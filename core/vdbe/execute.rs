@@ -58,8 +58,8 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{
-    get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, QueryMode,
+    get_cursor, CaptureDataChangesInfo, CheckpointMode, Connection, DatabaseStorage, IOExt,
+    MvCursor, QueryMode,
 };
 use crate::{CdcVersion, Statement};
 use either::Either;
@@ -170,6 +170,7 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Step,
+    SpawnedSubprogram,
 }
 
 impl<T> From<IOResult<T>> for InsnFunctionStepResult {
@@ -2873,12 +2874,25 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Debug)]
+pub(crate) enum SubprogramOutcome {
+    Done,
+    Error(LimboError),
+}
+
 pub(crate) enum OpProgramState {
     Start,
-    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
-    Step {
+    /// Running state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
+    Running {
         is_trigger: bool,
         statement: Box<Statement>,
+        execution_guard: SubprogramExecutionGuard,
+    },
+    /// Finished state retains the recursion guard until the parent consumes the
+    /// terminal outcome and advances its own Program opcode.
+    Finished {
+        is_trigger: bool,
+        outcome: SubprogramOutcome,
         execution_guard: SubprogramExecutionGuard,
     },
 }
@@ -2886,7 +2900,8 @@ pub(crate) enum OpProgramState {
 /// Tracks one active nested Program invocation across yields/retries.
 ///
 /// The recursion limit must count nested subprogram invocations, not individual
-/// `statement.step()` calls. Holding the guard in `OpProgramState::Step` keeps
+/// `statement.step()` calls. Holding the guard in `OpProgramState::Running` and
+/// `OpProgramState::Finished` keeps
 /// the depth active until the subprogram finishes or the state is dropped
 /// during reset/abort cleanup.
 pub(crate) struct SubprogramExecutionGuard {
@@ -2968,57 +2983,53 @@ pub fn op_program(
                 false
             };
 
-            state.op_program_state = OpProgramState::Step {
+            state.op_program_state = OpProgramState::Running {
                 is_trigger,
                 statement: Box::new(statement),
                 execution_guard,
             };
-            Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                Completion::new_yield(),
-            )))
+            Ok(InsnFunctionStepResult::SpawnedSubprogram)
         }
-        OpProgramState::Step {
+        OpProgramState::Running {
             is_trigger,
-            mut statement,
+            statement,
             execution_guard,
         } => {
-            match statement.execution_state() {
-                crate::vdbe::ProgramExecutionState::Done => {
-                    if is_trigger {
-                        program.connection.end_trigger_execution();
+            state.op_program_state = OpProgramState::Running {
+                is_trigger,
+                statement,
+                execution_guard,
+            };
+            Err(LimboError::InternalError(
+                "Program parent stepped before child finished".to_string(),
+            ))
+        }
+        OpProgramState::Finished {
+            is_trigger,
+            outcome,
+            execution_guard: _execution_guard,
+        } => {
+            if is_trigger {
+                program.connection.end_trigger_execution();
+            }
+            match outcome {
+                SubprogramOutcome::Done => {
+                    state.pc += 1;
+                    Ok(InsnFunctionStepResult::Step)
+                }
+                SubprogramOutcome::Error(LimboError::Constraint(constraint_err)) => {
+                    if program.resolve_type != ResolveType::Ignore {
+                        return Err(LimboError::Constraint(constraint_err));
                     }
                     state.pc += 1;
                     Ok(InsnFunctionStepResult::Step)
                 }
-                crate::vdbe::ProgramExecutionState::Failed => {
-                    match statement.take_last_step_error().expect(
-                        "subprogram finished with ProgramExecutionState::Failed but no error",
-                    ) {
-                        LimboError::Constraint(constraint_err) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                return Err(LimboError::Constraint(constraint_err));
-                            }
-                            state.pc += 1;
-                            Ok(InsnFunctionStepResult::Step)
-                        }
-                        LimboError::RaiseIgnore => {
-                            // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
-                            state.pc = ignore_jump_target.as_offset_int();
-                            Ok(InsnFunctionStepResult::Step)
-                        }
-                        err => Err(err),
-                    }
+                SubprogramOutcome::Error(LimboError::RaiseIgnore) => {
+                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
+                    state.pc = ignore_jump_target.as_offset_int();
+                    Ok(InsnFunctionStepResult::Step)
                 }
-                child_state => {
-                    state.op_program_state = OpProgramState::Step {
-                        is_trigger,
-                        statement,
-                        execution_guard,
-                    };
-                    Err(LimboError::InternalError(format!(
-                        "Program parent stepped before child finished: {child_state:?}"
-                    )))
-                }
+                SubprogramOutcome::Error(err) => Err(err),
             }
         }
     }
@@ -11606,7 +11617,11 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO(io))
         }
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+        Ok(
+            InsnFunctionStepResult::Done
+            | InsnFunctionStepResult::Row
+            | InsnFunctionStepResult::SpawnedSubprogram,
+        ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {

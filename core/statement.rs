@@ -28,6 +28,7 @@ use crate::{
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
+type ProgramStepResult = vdbe::ProgramStepResult;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
 
@@ -46,7 +47,6 @@ pub struct Statement {
     /// DML completed — only the scan-back remains. Used by reset_internal to decide
     /// commit vs rollback when a statement is abandoned.
     has_returned_row: bool,
-    last_step_error: Option<LimboError>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -79,7 +79,6 @@ impl Statement {
             busy: false,
             busy_handler_state: None,
             has_returned_row: false,
-            last_step_error: None,
         }
     }
 
@@ -131,7 +130,7 @@ impl Statement {
             .or_else(|| self.state.active_subprogram_mut()?.take_io_completions())
     }
 
-    fn step_single_frame(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    fn step_single_frame(&mut self, waker: Option<&Waker>) -> Result<ProgramStepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
                 .program
@@ -147,7 +146,7 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(StepResult::IO);
+                return Ok(ProgramStepResult::IO);
             }
         }
 
@@ -168,7 +167,7 @@ impl Statement {
         }
 
         // Aggregate metrics when statement completes
-        if matches!(res, Ok(StepResult::Done)) {
+        if matches!(res, Ok(ProgramStepResult::Done)) {
             let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
@@ -185,7 +184,7 @@ impl Statement {
         }
 
         // Handle busy result by invoking the busy handler
-        if matches!(res, Ok(StepResult::Busy)) {
+        if matches!(res, Ok(ProgramStepResult::Busy)) {
             let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
 
@@ -200,7 +199,7 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                res = Ok(StepResult::IO);
+                res = Ok(ProgramStepResult::IO);
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
@@ -209,7 +208,7 @@ impl Statement {
 
         // Track when a write statement yields its first Row. With ephemeral-buffered
         // RETURNING, this proves all DML completed — only the scan-back remains.
-        if matches!(res, Ok(StepResult::Row))
+        if matches!(res, Ok(ProgramStepResult::Row))
             && self.query_mode == QueryMode::Normal
             && self.program.change_cnt_on
             && !self.program.result_columns.is_empty()
@@ -217,14 +216,35 @@ impl Statement {
             self.has_returned_row = true;
         }
 
-        self.last_step_error = res.as_ref().err().cloned();
-        debug_assert_eq!(
-            self.last_step_error.is_some(),
-            matches!(self.execution_state(), ProgramExecutionState::Failed),
-            "failed statements must retain exactly one last_step_error for their parent"
-        );
-
         res
+    }
+
+    fn finish_deepest_terminal_subprogram(
+        &mut self,
+        outcome: vdbe::execute::SubprogramOutcome,
+    ) -> bool {
+        let mut current = self as *mut Statement;
+        loop {
+            let action = unsafe {
+                match (&mut *current).state.active_subprogram_mut() {
+                    Some(child)
+                        if matches!(
+                            child.execution_state(),
+                            ProgramExecutionState::Done | ProgramExecutionState::Failed
+                        ) =>
+                    {
+                        None
+                    }
+                    Some(child) => Some(child as *mut Statement),
+                    None => return false,
+                }
+            };
+
+            match action {
+                Some(next) => current = next,
+                None => return unsafe { (&mut *current).state.finish_active_subprogram(outcome) },
+            }
+        }
     }
 
     fn deepest_active_statement_mut(&mut self) -> &mut Statement {
@@ -254,15 +274,6 @@ impl Statement {
         }
     }
 
-    fn has_pending_subprogram_start(&mut self) -> bool {
-        matches!(
-            self.state
-                .active_subprogram_mut()
-                .map(|child| child.execution_state()),
-            Some(ProgramExecutionState::Init)
-        )
-    }
-
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         loop {
             let root_ptr: *mut Statement = self;
@@ -270,33 +281,54 @@ impl Statement {
             let is_nested = !std::ptr::eq(root_ptr, deepest as *mut Statement);
             let result = deepest.step_single_frame(waker);
 
-            if matches!(result, Ok(StepResult::IO)) && deepest.has_pending_subprogram_start() {
+            if matches!(result, Ok(ProgramStepResult::SpawnedSubprogram)) {
                 continue;
             }
 
             if !is_nested {
-                return result;
+                return match result {
+                    Ok(ProgramStepResult::Done) => Ok(StepResult::Done),
+                    Ok(ProgramStepResult::IO) => Ok(StepResult::IO),
+                    Ok(ProgramStepResult::Row) => Ok(StepResult::Row),
+                    Ok(ProgramStepResult::Interrupt) => Ok(StepResult::Interrupt),
+                    Ok(ProgramStepResult::Busy) => Ok(StepResult::Busy),
+                    Ok(ProgramStepResult::SpawnedSubprogram) => {
+                        unreachable!("root subprogram spawn should have continued already")
+                    }
+                    Err(err) => Err(err),
+                };
             }
 
             match result {
-                Ok(StepResult::Row | StepResult::Done) => continue,
-                Ok(StepResult::IO) => {
+                Ok(ProgramStepResult::Done) => {
+                    let finished = self
+                        .finish_deepest_terminal_subprogram(vdbe::execute::SubprogramOutcome::Done);
+                    debug_assert!(
+                        finished,
+                        "nested done child was not promoted to parent state"
+                    );
+                    continue;
+                }
+                Ok(ProgramStepResult::Row) => continue,
+                Ok(ProgramStepResult::IO) => {
                     self.busy = true;
                     return Ok(StepResult::IO);
                 }
-                Ok(StepResult::Busy | StepResult::Interrupt) => {
+                Ok(ProgramStepResult::Busy | ProgramStepResult::Interrupt) => {
                     self.busy = true;
                     return Ok(StepResult::Busy);
                 }
-                Err(_) => {
-                    debug_assert_eq!(
-                        deepest.execution_state(),
-                        ProgramExecutionState::Failed,
-                        "nested statement errors must leave the child in Failed state"
+                Err(err) => {
+                    let finished = self.finish_deepest_terminal_subprogram(
+                        vdbe::execute::SubprogramOutcome::Error(err),
                     );
-                    // Let the parent OP_Program consume the child's terminal state and error.
+                    debug_assert!(
+                        finished,
+                        "nested failed child was not promoted to parent state"
+                    );
                     continue;
                 }
+                Ok(ProgramStepResult::SpawnedSubprogram) => continue,
             }
         }
     }
@@ -699,7 +731,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::SpawnedSubprogram) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(
@@ -752,8 +785,6 @@ impl Statement {
         self.busy = false;
         self.busy_handler_state = None;
         self.has_returned_row = false;
-        self.last_step_error = None;
-
         if let Some(err) = reset_error {
             return Err(err);
         }
@@ -770,19 +801,6 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
-    }
-
-    pub(crate) fn take_last_step_error(&mut self) -> Option<LimboError> {
-        debug_assert_eq!(
-            self.execution_state(),
-            ProgramExecutionState::Failed,
-            "last_step_error should only be consumed from failed statements"
-        );
-        debug_assert!(
-            self.last_step_error.is_some(),
-            "failed statement lost last_step_error before its parent consumed it"
-        );
-        self.last_step_error.take()
     }
 
     /// Internal method to get IO from a statement.

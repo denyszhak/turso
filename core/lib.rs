@@ -1239,7 +1239,6 @@ impl Database {
             trigger_recursion_limit: AtomicI32::new(Connection::default_trigger_recursion_limit()),
             compiling_fk_actions: RwLock::new(Vec::new()),
             compiling_fk_actions_depth: AtomicI32::new(0),
-            fk_action_deferred_slot: RwLock::new(None),
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),

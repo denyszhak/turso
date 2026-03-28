@@ -54,18 +54,23 @@ pub(crate) enum FkActionCompileKey {
     UpdateSetDefault(usize),
 }
 
-/// A deferred slot that will be filled with a `Weak` back-pointer once the
-/// self-referential subprogram finishes building.
-pub(crate) type DeferredSubprogramSlot = Arc<std::sync::OnceLock<std::sync::Weak<crate::PreparedProgram>>>;
+/// A backpatch handle that will be filled with a `Weak` reference once the
+/// referenced FK action subprogram finishes building.
+pub(crate) type SubprogramBackpatch =
+    Arc<std::sync::OnceLock<std::sync::Weak<crate::PreparedProgram>>>;
+
+#[derive(Debug)]
+pub(crate) struct FkActionCompileFrame {
+    key: FkActionCompileKey,
+    backpatch: SubprogramBackpatch,
+}
 
 /// Result of `start_fk_action_compilation`.
 pub(crate) enum FkCompilationStart {
     /// No cycle — proceed with normal compilation.
     Proceed,
-    /// Cycle detected — use this deferred slot for the self-referencing Program opcode.
-    /// Contains a `Weak`-based slot: the parent holds the strong `Arc`, the self-ref
-    /// instruction stores only a `Weak` to break the reference cycle.
-    CycleDetected(DeferredSubprogramSlot),
+    /// Cycle detected — use the active compile frame's backpatch handle for the Program opcode.
+    CycleDetected(SubprogramBackpatch),
 }
 
 /// Database connection handle.
@@ -150,16 +155,11 @@ pub struct Connection {
     /// Per-connection recursion limit for trigger/FK subprogram calls.
     pub(super) trigger_recursion_limit: AtomicI32,
     /// Stack of FK action subprograms currently being compiled.
-    /// Used to break recursive FK subprogram compilation cycles.
-    pub(super) compiling_fk_actions: RwLock<Vec<FkActionCompileKey>>,
+    /// Each frame carries the backpatch handle that cycle edges should use.
+    pub(super) compiling_fk_actions: RwLock<Vec<FkActionCompileFrame>>,
     /// Current FK action subprogram compilation depth.
     /// Self-referential and cyclic CASCADE actions recursively compile nested subprograms.
     pub(super) compiling_fk_actions_depth: AtomicI32,
-    /// Deferred subprogram slot for self-referential FK cascades.
-    /// Created when a cycle is detected, filled after the outer subprogram builds.
-    /// At most one self-referential cycle can be in-flight at a time during compilation.
-    pub(super) fk_action_deferred_slot:
-        RwLock<Option<(FkActionCompileKey, DeferredSubprogramSlot)>>,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -279,42 +279,30 @@ impl Connection {
         }
 
         let mut compiling_fk_actions = self.compiling_fk_actions.write();
-        if compiling_fk_actions.iter().any(|active| active == &key) {
+        if let Some(active) = compiling_fk_actions
+            .iter()
+            .rev()
+            .find(|active| active.key == key)
+        {
             self.compiling_fk_actions_depth
                 .fetch_sub(1, Ordering::SeqCst);
-            // Cycle detected — return a deferred slot instead of erroring.
-            let mut slot_guard = self.fk_action_deferred_slot.write();
-            let slot = match slot_guard.as_ref() {
-                Some((k, s)) if *k == key => s.clone(),
-                _ => {
-                    let s = Arc::new(std::sync::OnceLock::new());
-                    *slot_guard = Some((key, s.clone()));
-                    s
-                }
-            };
-            return Ok(FkCompilationStart::CycleDetected(slot));
+            return Ok(FkCompilationStart::CycleDetected(active.backpatch.clone()));
         }
-        compiling_fk_actions.push(key);
+        compiling_fk_actions.push(FkActionCompileFrame {
+            key,
+            backpatch: Arc::new(std::sync::OnceLock::new()),
+        });
 
         Ok(FkCompilationStart::Proceed)
     }
 
-    /// Retrieve and remove the deferred slot after the outer subprogram finishes building.
-    pub(crate) fn take_fk_action_deferred_slot(
+    pub(crate) fn end_fk_action_compilation(
         &self,
-        key: &FkActionCompileKey,
-    ) -> Option<DeferredSubprogramSlot> {
-        let mut slot_guard = self.fk_action_deferred_slot.write();
-        match slot_guard.as_ref() {
-            Some((k, _)) if k == key => slot_guard.take().map(|(_, s)| s),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn end_fk_action_compilation(&self, expected_key: FkActionCompileKey) {
+        expected_key: FkActionCompileKey,
+    ) -> SubprogramBackpatch {
         let popped = self.compiling_fk_actions.write().pop();
         debug_assert_eq!(
-            popped,
+            popped.as_ref().map(|frame| frame.key),
             Some(expected_key),
             "fk action compilation stack out of sync"
         );
@@ -327,6 +315,9 @@ impl Connection {
             prev > 0,
             "end_fk_action_compilation called without matching start"
         );
+        popped
+            .expect("fk action compilation stack out of sync")
+            .backpatch
     }
 
     pub(crate) fn start_subprogram_execution(&self) -> Result<()> {

@@ -2923,6 +2923,38 @@ impl Drop for SubprogramExecutionGuard {
     }
 }
 
+fn finish_subprogram_outcome(
+    program: &Program,
+    state: &mut ProgramState,
+    is_trigger: bool,
+    outcome: SubprogramOutcome,
+    ignore_jump_pc: u32,
+) -> Result<InsnFunctionStepResult> {
+    if is_trigger {
+        program.connection.end_trigger_execution();
+    }
+
+    match outcome {
+        SubprogramOutcome::Done => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SubprogramOutcome::Error(LimboError::Constraint(constraint_err)) => {
+            if program.resolve_type != ResolveType::Ignore {
+                return Err(LimboError::Constraint(constraint_err));
+            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SubprogramOutcome::Error(LimboError::RaiseIgnore) => {
+            // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
+            state.pc = ignore_jump_pc;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SubprogramOutcome::Error(err) => Err(err),
+    }
+}
+
 /// Execute a subprogram (Program opcode).
 /// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
@@ -3008,30 +3040,13 @@ pub fn op_program(
             is_trigger,
             outcome,
             execution_guard: _execution_guard,
-        } => {
-            if is_trigger {
-                program.connection.end_trigger_execution();
-            }
-            match outcome {
-                SubprogramOutcome::Done => {
-                    state.pc += 1;
-                    Ok(InsnFunctionStepResult::Step)
-                }
-                SubprogramOutcome::Error(LimboError::Constraint(constraint_err)) => {
-                    if program.resolve_type != ResolveType::Ignore {
-                        return Err(LimboError::Constraint(constraint_err));
-                    }
-                    state.pc += 1;
-                    Ok(InsnFunctionStepResult::Step)
-                }
-                SubprogramOutcome::Error(LimboError::RaiseIgnore) => {
-                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
-                    state.pc = ignore_jump_target.as_offset_int();
-                    Ok(InsnFunctionStepResult::Step)
-                }
-                SubprogramOutcome::Error(err) => Err(err),
-            }
-        }
+        } => finish_subprogram_outcome(
+            program,
+            state,
+            is_trigger,
+            outcome,
+            ignore_jump_target.as_offset_int(),
+        ),
     }
 }
 

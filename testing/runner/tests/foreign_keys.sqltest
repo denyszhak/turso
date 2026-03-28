@@ -1691,6 +1691,31 @@ expect {
     0
 }
 
+# Over-limit self-referential CASCADE should return a bounded recursion error.
+@cross-check-integrity
+test fk-cascade-delete-self-reference-depth-limit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES t(id) ON DELETE CASCADE
+    );
+    CREATE TABLE digits(d INTEGER PRIMARY KEY);
+    INSERT INTO digits VALUES
+        (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+    INSERT INTO t
+    SELECT n + 1, CASE WHEN n = 0 THEN NULL ELSE n END
+    FROM (
+        SELECT ones.d + 10 * tens.d + 100 * hundreds.d + 1000 * thousands.d AS n
+        FROM digits AS ones, digits AS tens, digits AS hundreds, digits AS thousands
+    ) AS seq
+    WHERE n < 1002
+    ORDER BY n;
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+    too many levels of trigger recursion
+}
+
 # Basic ON UPDATE CASCADE - single child row
 @cross-check-integrity
 test fk-cascade-update-basic {

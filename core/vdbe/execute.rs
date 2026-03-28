@@ -34,7 +34,7 @@ use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup,
+    TxnCleanup,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -2873,13 +2873,39 @@ pub fn op_integer(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub enum OpProgramState {
+pub(crate) enum OpProgramState {
     Start,
     /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Step {
         is_trigger: bool,
         statement: Box<Statement>,
+        execution_guard: SubprogramExecutionGuard,
     },
+}
+
+/// Tracks one active nested Program invocation across yields/retries.
+///
+/// The recursion limit must count nested subprogram invocations, not individual
+/// `statement.step()` calls. Holding the guard in `OpProgramState::Step` keeps
+/// the depth active until the subprogram finishes or the state is dropped
+/// during reset/abort cleanup.
+pub(crate) struct SubprogramExecutionGuard {
+    connection: Arc<Connection>,
+}
+
+impl SubprogramExecutionGuard {
+    fn enter(connection: &Arc<Connection>) -> Result<Self> {
+        connection.start_subprogram_execution()?;
+        Ok(Self {
+            connection: connection.clone(),
+        })
+    }
+}
+
+impl Drop for SubprogramExecutionGuard {
+    fn drop(&mut self) {
+        self.connection.end_subprogram_execution();
+    }
 }
 
 /// Execute a subprogram (Program opcode).
@@ -2898,118 +2924,101 @@ pub fn op_program(
         },
         insn
     );
-    loop {
-        match &mut state.op_program_state {
-            OpProgramState::Start => {
-                let mut statement = Statement::new(
-                    Program::from_prepared(subprogram.resolve()?, program.connection.clone()),
-                    pager.clone(),
-                    QueryMode::Normal,
-                );
-                statement.reset()?;
+    match std::mem::replace(&mut state.op_program_state, OpProgramState::Start) {
+        OpProgramState::Start => {
+            let mut statement = Statement::new(
+                Program::from_prepared(subprogram.resolve()?, program.connection.clone()),
+                pager.clone(),
+                QueryMode::Normal,
+            );
+            statement.reset()?;
 
-                // Check if this is a trigger subprogram - if so, track execution
-                let is_trigger = if let Some(ref trigger) = statement.get_trigger() {
-                    program.connection.start_trigger_execution(trigger.clone());
-                    true
-                } else {
-                    false
-                };
+            let trigger = statement.get_trigger();
 
-                // Extract register values from params (which contain register indices encoded as negative integers)
-                // and bind them to the subprogram's parameters
-                for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
-                        let reg_idx = *reg_idx as usize;
-                        if reg_idx < state.registers.len() {
-                            let value = state.registers[reg_idx].get_value().clone();
-                            let param_index = NonZero::<usize>::new(param_idx + 1)
-                                .expect("param_idx + 1 should be non-zero");
-                            statement.bind_at(param_index, value);
-                        } else {
-                            crate::bail_corrupt_error!(
-                                "Register index {} out of bounds (len={})",
-                                reg_idx,
-                                state.registers.len()
-                            );
-                        }
+            // Extract register values from params (which contain register indices encoded as negative integers)
+            // and bind them to the subprogram's parameters
+            for (param_idx, param_value) in params.iter().enumerate() {
+                if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
+                    let reg_idx = *reg_idx as usize;
+                    if reg_idx < state.registers.len() {
+                        let value = state.registers[reg_idx].get_value().clone();
+                        let param_index = NonZero::<usize>::new(param_idx + 1)
+                            .expect("param_idx + 1 should be non-zero");
+                        statement.bind_at(param_index, value);
                     } else {
-                        crate::bail_parse_error!(
-                            "Subprogram parameters should be integers, got {:?}",
-                            param_value
+                        crate::bail_corrupt_error!(
+                            "Register index {} out of bounds (len={})",
+                            reg_idx,
+                            state.registers.len()
                         );
                     }
+                } else {
+                    crate::bail_parse_error!(
+                        "Subprogram parameters should be integers, got {:?}",
+                        param_value
+                    );
                 }
-
-                state.op_program_state = OpProgramState::Step {
-                    is_trigger,
-                    statement: Box::new(statement),
-                };
             }
-            OpProgramState::Step {
+
+            let execution_guard = SubprogramExecutionGuard::enter(&program.connection)?;
+            let is_trigger = if let Some(trigger) = trigger {
+                program.connection.start_trigger_execution(trigger);
+                true
+            } else {
+                false
+            };
+
+            state.op_program_state = OpProgramState::Step {
                 is_trigger,
-                statement,
-            } => {
-                let is_trigger = *is_trigger;
-                let mut raise_ignore = false;
-                // Track whether the subprogram aborted with an error. When abort()
-                // runs inside the subprogram, it already calls end_trigger_execution(),
-                // so we must not call it again after the loop.
-                let mut subprogram_aborted = false;
-                loop {
-                    if let Err(err) = program.connection.start_subprogram_execution() {
-                        if is_trigger {
-                            program.connection.end_trigger_execution();
-                        }
-                        return Err(err);
+                statement: Box::new(statement),
+                execution_guard,
+            };
+            Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                Completion::new_yield(),
+            )))
+        }
+        OpProgramState::Step {
+            is_trigger,
+            mut statement,
+            execution_guard,
+        } => {
+            match statement.execution_state() {
+                crate::vdbe::ProgramExecutionState::Done => {
+                    if is_trigger {
+                        program.connection.end_trigger_execution();
                     }
-                    let res = statement.step();
-                    program.connection.end_subprogram_execution();
-                    match res {
-                        Ok(step_result) => match step_result {
-                            StepResult::Done => break,
-                            StepResult::IO => {
-                                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                                    Completion::new_yield(),
-                                )));
-                            }
-                            StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
-                                return Err(LimboError::Busy);
-                            }
-                        },
-                        Err(LimboError::Constraint(constraint_err)) => {
+                    state.pc += 1;
+                    Ok(InsnFunctionStepResult::Step)
+                }
+                crate::vdbe::ProgramExecutionState::Failed => {
+                    match statement.take_last_step_error().expect(
+                        "subprogram finished with ProgramExecutionState::Failed but no error",
+                    ) {
+                        LimboError::Constraint(constraint_err) => {
                             if program.resolve_type != ResolveType::Ignore {
                                 return Err(LimboError::Constraint(constraint_err));
                             }
-                            subprogram_aborted = true;
-                            break;
+                            state.pc += 1;
+                            Ok(InsnFunctionStepResult::Step)
                         }
-                        Err(LimboError::RaiseIgnore) => {
-                            raise_ignore = true;
-                            subprogram_aborted = true;
-                            break;
+                        LimboError::RaiseIgnore => {
+                            // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
+                            state.pc = ignore_jump_target.as_offset_int();
+                            Ok(InsnFunctionStepResult::Step)
                         }
-                        Err(err) => {
-                            return Err(err);
-                        }
+                        err => Err(err),
                     }
                 }
-
-                // Only end trigger execution for normal completion. Error paths
-                // already called end_trigger_execution() via abort() in the subprogram.
-                if is_trigger && !subprogram_aborted {
-                    program.connection.end_trigger_execution();
+                child_state => {
+                    state.op_program_state = OpProgramState::Step {
+                        is_trigger,
+                        statement,
+                        execution_guard,
+                    };
+                    Err(LimboError::InternalError(format!(
+                        "Program parent stepped before child finished: {child_state:?}"
+                    )))
                 }
-
-                state.op_program_state = OpProgramState::Start;
-                if raise_ignore {
-                    // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
-                    state.pc = ignore_jump_target.as_offset_int();
-                } else {
-                    state.pc += 1;
-                }
-                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }

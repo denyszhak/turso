@@ -519,6 +519,13 @@ impl ProgramState {
         self.parameters.get(&index).cloned().unwrap_or(Value::Null)
     }
 
+    pub(crate) fn active_subprogram_mut(&mut self) -> Option<&mut crate::Statement> {
+        match &mut self.op_program_state {
+            OpProgramState::Step { statement, .. } => Some(statement.as_mut()),
+            OpProgramState::Start => None,
+        }
+    }
+
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
         self.pc = 0;
@@ -561,6 +568,7 @@ impl ProgramState {
         self.op_integrity_check_state = OpIntegrityCheckState::Start;
         self.metrics = StatementMetrics::new();
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+        self.op_program_state = OpProgramState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
         self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
         self.op_insert_state = OpInsertState {

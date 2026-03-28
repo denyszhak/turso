@@ -46,6 +46,7 @@ pub struct Statement {
     /// DML completed — only the scan-back remains. Used by reset_internal to decide
     /// commit vs rollback when a statement is abandoned.
     has_returned_row: bool,
+    last_step_error: Option<LimboError>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -78,6 +79,7 @@ impl Statement {
             busy: false,
             busy_handler_state: None,
             has_returned_row: false,
+            last_step_error: None,
         }
     }
 
@@ -123,10 +125,13 @@ impl Statement {
     /// Returns None if no IO is pending.
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
-        self.state.io_completions.take()
+        self.state
+            .io_completions
+            .take()
+            .or_else(|| self.state.active_subprogram_mut()?.take_io_completions())
     }
 
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    fn step_single_frame(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
                 .program
@@ -212,7 +217,88 @@ impl Statement {
             self.has_returned_row = true;
         }
 
+        self.last_step_error = res.as_ref().err().cloned();
+        debug_assert_eq!(
+            self.last_step_error.is_some(),
+            matches!(self.execution_state(), ProgramExecutionState::Failed),
+            "failed statements must retain exactly one last_step_error for their parent"
+        );
+
         res
+    }
+
+    fn deepest_active_statement_mut(&mut self) -> &mut Statement {
+        let mut current = self as *mut Statement;
+        loop {
+            // SAFETY: `current` always points to a live statement in the unique
+            // nested subprogram chain rooted at `self`, and we only follow one
+            // child link at a time.
+            let next = unsafe {
+                match (&mut *current).state.active_subprogram_mut() {
+                    Some(child)
+                        if !matches!(
+                            child.execution_state(),
+                            ProgramExecutionState::Done | ProgramExecutionState::Failed
+                        ) =>
+                    {
+                        Some(child as *mut Statement)
+                    }
+                    _ => None,
+                }
+            };
+
+            match next {
+                Some(next) => current = next,
+                None => return unsafe { &mut *current },
+            }
+        }
+    }
+
+    fn has_pending_subprogram_start(&mut self) -> bool {
+        matches!(
+            self.state
+                .active_subprogram_mut()
+                .map(|child| child.execution_state()),
+            Some(ProgramExecutionState::Init)
+        )
+    }
+
+    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        loop {
+            let root_ptr: *mut Statement = self;
+            let deepest = self.deepest_active_statement_mut();
+            let is_nested = !std::ptr::eq(root_ptr, deepest as *mut Statement);
+            let result = deepest.step_single_frame(waker);
+
+            if matches!(result, Ok(StepResult::IO)) && deepest.has_pending_subprogram_start() {
+                continue;
+            }
+
+            if !is_nested {
+                return result;
+            }
+
+            match result {
+                Ok(StepResult::Row | StepResult::Done) => continue,
+                Ok(StepResult::IO) => {
+                    self.busy = true;
+                    return Ok(StepResult::IO);
+                }
+                Ok(StepResult::Busy | StepResult::Interrupt) => {
+                    self.busy = true;
+                    return Ok(StepResult::Busy);
+                }
+                Err(_) => {
+                    debug_assert_eq!(
+                        deepest.execution_state(),
+                        ProgramExecutionState::Failed,
+                        "nested statement errors must leave the child in Failed state"
+                    );
+                    // Let the parent OP_Program consume the child's terminal state and error.
+                    continue;
+                }
+            }
+        }
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
@@ -666,6 +752,7 @@ impl Statement {
         self.busy = false;
         self.busy_handler_state = None;
         self.has_returned_row = false;
+        self.last_step_error = None;
 
         if let Some(err) = reset_error {
             return Err(err);
@@ -683,6 +770,19 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    pub(crate) fn take_last_step_error(&mut self) -> Option<LimboError> {
+        debug_assert_eq!(
+            self.execution_state(),
+            ProgramExecutionState::Failed,
+            "last_step_error should only be consumed from failed statements"
+        );
+        debug_assert!(
+            self.last_step_error.is_some(),
+            "failed statement lost last_step_error before its parent consumed it"
+        );
+        self.last_step_error.take()
     }
 
     /// Internal method to get IO from a statement.

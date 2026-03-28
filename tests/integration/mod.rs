@@ -1,6 +1,7 @@
 mod assert_details;
 mod common;
 mod conflict_resolution;
+mod foreign_keys;
 mod functions;
 mod fuzz_transaction;
 mod index_method;
@@ -10,6 +11,7 @@ mod pragma;
 mod query_processing;
 mod statement_reset;
 mod storage;
+mod subprograms;
 mod trigger;
 mod wal;
 

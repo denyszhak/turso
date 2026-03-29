@@ -1,10 +1,10 @@
 use crate::{vdbe::insn::SubprogramBackpatch, LimboError, Result};
 use std::sync::{Arc, OnceLock};
 
-/// Internal safety belt for recursive FK action compilation.
+/// Internal recursion guard for FK action compilation.
 ///
-/// This is intentionally separate from the user-visible trigger recursion limit,
-/// which only governs runtime nested subprogram execution.
+/// This is separate from the user-visible trigger recursion limit, which only
+/// applies while nested subprograms are executing.
 const MAX_FK_ACTION_COMPILE_DEPTH: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

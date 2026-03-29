@@ -1306,11 +1306,8 @@ fn emit_fk_action_subprogram(
 ) -> Result<()> {
     match resolver.start_fk_action_compilation(compile_key)? {
         FkCompilationStart::CycleDetected(backpatch) => {
-            // The prepare-scoped compile context stops infinite recursive code
-            // generation here, but execution still needs a real Program edge
-            // so the runtime scheduler can recurse through the FK action graph
-            // later. Emit a backpatch reference now and fill it once the
-            // in-flight subprogram is fully built.
+            // Stop recursive compilation here, but still emit a Program edge so
+            // execution can recurse through the FK action graph later.
             let params = build_fk_action_params(ctx);
             let ignore_jump_target = program.allocate_label();
             program.emit_insn(Insn::Program {

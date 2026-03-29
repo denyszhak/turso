@@ -9,9 +9,9 @@ pub(crate) type SubprogramBackpatch = Arc<std::sync::OnceLock<std::sync::Weak<Pr
 ///
 /// `Ready` is the normal case where the subprogram is available at compile time.
 /// `Backpatch` is used for recursive FK action graphs discovered during a
-/// single prepare pass. Translation emits a prepare-scoped handle first, then
-/// fills it once the target subprogram finishes building. It resolves through a
-/// `Weak` reference so cycles do not create `Arc` leaks.
+/// single prepare pass. Translation emits a handle first and fills it after the
+/// target subprogram finishes building. The handle stores a `Weak` reference so
+/// cycles do not create `Arc` leaks.
 #[derive(Debug, Clone)]
 pub enum SubprogramRef {
     Ready(Arc<PreparedProgram>),

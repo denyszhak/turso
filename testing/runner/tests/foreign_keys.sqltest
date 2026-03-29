@@ -1691,6 +1691,31 @@ expect {
     0
 }
 
+# Two-table CASCADE cycle should compile to a real recursive FK action graph
+# and delete both rows without overflowing the stack.
+@cross-check-integrity
+test fk-cascade-delete-two-table-cycle {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE a(
+        id INTEGER PRIMARY KEY,
+        b_id INTEGER REFERENCES b(id) ON DELETE CASCADE
+    );
+    CREATE TABLE b(
+        id INTEGER PRIMARY KEY,
+        a_id INTEGER REFERENCES a(id) ON DELETE CASCADE
+    );
+    INSERT INTO a VALUES(1, 1);
+    INSERT INTO b VALUES(1, 1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM a;
+    SELECT count(*) FROM b;
+}
+expect {
+    0
+    0
+}
+
 # Over-limit self-referential CASCADE should return a bounded recursion error.
 @cross-check-integrity
 test fk-cascade-delete-self-reference-depth-limit {

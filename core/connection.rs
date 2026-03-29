@@ -260,6 +260,10 @@ impl Connection {
         );
     }
 
+    /// Track recursive FK action compilation so we can stop rebuilding the same
+    /// subprogram graph and instead emit a backpatch edge. This currently
+    /// reuses the user-visible trigger depth limit as a conservative compiler
+    /// guard; execution depth is enforced separately in `start_subprogram_execution`.
     pub(crate) fn start_fk_action_compilation(
         &self,
         key: FkActionCompileKey,
@@ -273,9 +277,7 @@ impl Connection {
         if depth > limit {
             self.compiling_fk_actions_depth
                 .fetch_sub(1, Ordering::SeqCst);
-            return Err(LimboError::ParseError(
-                "too many levels of trigger recursion".to_string(),
-            ));
+            return Err(LimboError::TooManyLevelsOfTriggerRecursion);
         }
 
         let mut compiling_fk_actions = self.compiling_fk_actions.write();
@@ -320,6 +322,8 @@ impl Connection {
             .backpatch
     }
 
+    /// Enforce the user-visible trigger/FK execution depth limit while nested
+    /// subprograms are actually running.
     pub(crate) fn start_subprogram_execution(&self) -> Result<()> {
         let depth = self
             .executing_subprogram_depth
@@ -330,9 +334,7 @@ impl Connection {
         if depth > limit {
             self.executing_subprogram_depth
                 .fetch_sub(1, Ordering::SeqCst);
-            return Err(LimboError::ParseError(
-                "too many levels of trigger recursion".to_string(),
-            ));
+            return Err(LimboError::TooManyLevelsOfTriggerRecursion);
         }
 
         Ok(())

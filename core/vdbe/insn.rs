@@ -7,8 +7,9 @@ use std::{
 ///
 /// `Ready` is the normal case where the subprogram is available at compile time.
 /// `Backpatch` is used for recursive FK action graphs. The handle is patched
-/// after the target subprogram finishes building and resolves through a `Weak`
-/// reference so cycles do not create `Arc` leaks.
+/// after the target subprogram finishes building and survives into runtime so
+/// recursive `Program` edges can still be resolved after compilation ends. It
+/// resolves through a `Weak` reference so cycles do not create `Arc` leaks.
 #[derive(Debug, Clone)]
 pub enum SubprogramRef {
     Ready(Arc<PreparedProgram>),
@@ -1760,7 +1761,18 @@ pub enum Cookie {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use strum::VariantArray;
+
+    use crate::{
+        parameters::Parameters,
+        storage::database::DatabaseFile,
+        sync::{Arc, OnceLock},
+        translate::plan::TableReferences,
+        Database, LimboError, MemoryIO, OpenFlags, PrepareContext,
+    };
+    use turso_parser::ast::ResolveType;
 
     #[test]
     fn test_make_sure_correct_insn_table() {
@@ -1773,5 +1785,45 @@ mod tests {
                 variant, *variant as usize
             );
         }
+    }
+
+    #[test]
+    fn backpatch_resolve_reports_expired_target() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file(":memory:", OpenFlags::Create, true).unwrap();
+        let db = Database::open(io, ":memory:", Arc::new(DatabaseFile::new(file))).unwrap();
+        let conn = db.connect().unwrap();
+
+        let prepared = Arc::new(super::PreparedProgram {
+            max_registers: 0,
+            insns: Vec::new(),
+            cursor_ref: Vec::new(),
+            comments: Vec::new(),
+            parameters: Parameters::new(),
+            change_cnt_on: false,
+            result_columns: Vec::new(),
+            table_references: TableReferences::new_empty(),
+            sql: String::new(),
+            needs_stmt_subtransactions: Arc::new(AtomicBool::new(false)),
+            trigger: None,
+            is_subprogram: true,
+            contains_trigger_subprograms: false,
+            resolve_type: ResolveType::Abort,
+            prepare_context: PrepareContext::from_connection(&conn),
+            write_databases: crate::HashSet::default(),
+            read_databases: crate::HashSet::default(),
+        });
+
+        let backpatch = Arc::new(OnceLock::new());
+        backpatch
+            .set(Arc::downgrade(&prepared))
+            .expect("backpatch should only be filled once");
+        drop(prepared);
+
+        let result = super::SubprogramRef::Backpatch(backpatch).resolve();
+        assert!(
+            matches!(result, Err(LimboError::InternalError(ref msg)) if msg.contains("subprogram backpatch expired")),
+            "expected expired backpatch error, got {result:?}"
+        );
     }
 }

@@ -1302,8 +1302,10 @@ fn emit_fk_action_subprogram(
 ) -> Result<()> {
     match connection.start_fk_action_compilation(compile_key)? {
         FkCompilationStart::CycleDetected(backpatch) => {
-            // Recursive FK graph — emit a Program opcode that will be backpatched
-            // once the target subprogram finishes building.
+            // Cycle detection stops recursive compilation, but we still need a
+            // real Program edge in bytecode so execution can recurse through
+            // the FK action graph later. Emit a backpatch reference now and
+            // fill it once the in-flight subprogram is fully built.
             let params = build_fk_action_params(ctx);
             let ignore_jump_target = program.allocate_label();
             program.emit_insn(Insn::Program {
@@ -1323,15 +1325,16 @@ fn emit_fk_action_subprogram(
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
         );
+        let mut subprogram_resolver = resolver.fork();
         subprogram_builder.prologue();
         translate_inner(
             stmt,
-            resolver,
+            &mut subprogram_resolver,
             &mut subprogram_builder,
             connection,
             description,
         )?;
-        subprogram_builder.epilogue(resolver.schema());
+        subprogram_builder.epilogue(subprogram_resolver.schema());
         subprogram_builder.build(connection.clone(), true, description)
     })();
 
@@ -1340,7 +1343,8 @@ fn emit_fk_action_subprogram(
     let built_subprogram = build_subprogram_result?;
 
     // Patch any recursive references to this in-flight subprogram now that the
-    // final prepared program exists. Use a Weak reference to avoid ownership cycles.
+    // final prepared program exists. Use a Weak reference so mutually recursive
+    // FK action graphs do not create strong Arc cycles.
     backpatch
         .set(Arc::downgrade(built_subprogram.prepared()))
         .expect("FK subprogram backpatch already filled");

@@ -25,14 +25,21 @@ fn create_self_referencing_chain(conn: &Arc<Connection>, len: usize) -> Result<(
     Ok(())
 }
 
-fn assert_count(conn: &Arc<Connection>, expected: i64) {
-    let rows = limbo_exec_rows(conn, "SELECT count(*) FROM t");
+fn assert_table_count(conn: &Arc<Connection>, table: &str, expected: i64) {
+    let rows = limbo_exec_rows(conn, &format!("SELECT count(*) FROM {table}"));
     assert_eq!(rows.len(), 1, "expected a single count row");
     assert_eq!(rows[0].len(), 1, "expected a single count column");
     match rows[0].first() {
         Some(SqlValue::Integer(actual)) => assert_eq!(*actual, expected),
         other => panic!("expected integer count result, got {other:?}"),
     }
+}
+
+fn assert_trigger_recursion_error(result: Result<(), LimboError>) {
+    assert!(
+        matches!(result, Err(LimboError::TooManyLevelsOfTriggerRecursion)),
+        "expected bounded recursion error, got {result:?}"
+    );
 }
 
 #[turso_macros::test()]
@@ -42,11 +49,8 @@ fn fk_cascade_delete_self_reference_honors_runtime_limit(tmp_db: TempDatabase) -
     create_self_referencing_chain(&conn, 4)?;
 
     let result = conn.execute("DELETE FROM t WHERE id = 1");
-    assert!(
-        matches!(result, Err(LimboError::ParseError(ref msg)) if msg.contains("too many levels of trigger recursion")),
-        "expected bounded recursion error, got {result:?}"
-    );
-    assert_count(&conn, 4);
+    assert_trigger_recursion_error(result);
+    assert_table_count(&conn, "t", 4);
 
     Ok(())
 }
@@ -58,11 +62,36 @@ fn fk_cascade_delete_self_reference_hits_default_depth_limit(tmp_db: TempDatabas
     create_self_referencing_chain(&conn, chain_len)?;
 
     let result = conn.execute("DELETE FROM t WHERE id = 1");
-    assert!(
-        matches!(result, Err(LimboError::ParseError(ref msg)) if msg.contains("too many levels of trigger recursion")),
-        "expected bounded recursion error, got {result:?}"
-    );
-    assert_count(&conn, chain_len as i64);
+    assert_trigger_recursion_error(result);
+    assert_table_count(&conn, "t", chain_len as i64);
+
+    Ok(())
+}
+
+#[turso_macros::test()]
+fn fk_cascade_delete_two_table_cycle_deletes_both_rows(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys=OFF")?;
+    conn.execute(
+        "CREATE TABLE a(
+            id INTEGER PRIMARY KEY,
+            b_id INTEGER REFERENCES b(id) ON DELETE CASCADE
+        )",
+    )?;
+    conn.execute(
+        "CREATE TABLE b(
+            id INTEGER PRIMARY KEY,
+            a_id INTEGER REFERENCES a(id) ON DELETE CASCADE
+        )",
+    )?;
+    conn.execute("INSERT INTO a VALUES (1, 1)")?;
+    conn.execute("INSERT INTO b VALUES (1, 1)")?;
+    conn.execute("PRAGMA foreign_keys=ON")?;
+
+    conn.execute("DELETE FROM a WHERE id = 1")?;
+
+    assert_table_count(&conn, "a", 0);
+    assert_table_count(&conn, "b", 0);
 
     Ok(())
 }

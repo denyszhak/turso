@@ -53,9 +53,7 @@ impl FkCompileContext {
         }
 
         if self.compiling_actions.len() >= MAX_FK_ACTION_COMPILE_DEPTH {
-            return Err(LimboError::ParseError(format!(
-                "foreign key action graph is too deep to compile (>{MAX_FK_ACTION_COMPILE_DEPTH} nested subprograms)"
-            )));
+            return Err(LimboError::FkActionCompileDepthExceeded);
         }
 
         self.compiling_actions.push(FkActionCompileFrame {
@@ -81,5 +79,32 @@ impl FkCompileContext {
         );
 
         frame.backpatch
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FkActionCompileKey, FkCompileContext, MAX_FK_ACTION_COMPILE_DEPTH};
+    use crate::LimboError;
+
+    #[test]
+    fn fk_compile_depth_limit_has_dedicated_error() {
+        let mut ctx = FkCompileContext::new();
+
+        for i in 0..MAX_FK_ACTION_COMPILE_DEPTH {
+            let result = ctx.start_action_compilation(FkActionCompileKey::DeleteCascade(i));
+            assert!(
+                result.is_ok(),
+                "unexpected failure at depth {i}: {result:?}"
+            );
+        }
+
+        let result = ctx.start_action_compilation(FkActionCompileKey::DeleteCascade(
+            MAX_FK_ACTION_COMPILE_DEPTH,
+        ));
+        assert!(
+            matches!(result, Err(LimboError::FkActionCompileDepthExceeded)),
+            "expected dedicated compile-depth error, got {result:?}"
+        );
     }
 }

@@ -2283,6 +2283,7 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
         LimboError::TooManyLevelsOfTriggerRecursion => SQLITE_ERROR,
+        LimboError::FkActionCompileDepthExceeded => SQLITE_ERROR,
         _ => SQLITE_ERROR,
     }
 }
@@ -2339,6 +2340,17 @@ mod tests {
         assert_eq!(
             handle_limbo_err(
                 LimboError::TooManyLevelsOfTriggerRecursion,
+                std::ptr::null_mut()
+            ),
+            SQLITE_ERROR
+        );
+    }
+
+    #[test]
+    fn fk_compile_depth_error_maps_to_sqlite_error() {
+        assert_eq!(
+            handle_limbo_err(
+                LimboError::FkActionCompileDepthExceeded,
                 std::ptr::null_mut()
             ),
             SQLITE_ERROR

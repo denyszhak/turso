@@ -71,6 +71,8 @@ pub enum LimboError {
     Interrupt,
     #[error("too many levels of trigger recursion")]
     TooManyLevelsOfTriggerRecursion,
+    #[error("foreign key action graph is too deep to compile")]
+    FkActionCompileDepthExceeded,
     #[error("Database snapshot is stale. You must rollback and retry the whole transaction.")]
     BusySnapshot,
     #[error("Conflict: {0}")]

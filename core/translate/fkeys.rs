@@ -3,10 +3,14 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
-    connection::{FkActionCompileKey, FkCompilationStart},
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{
+        collate::CollationSeq,
+        emitter::Resolver,
+        fk_compile::{FkActionCompileKey, FkCompilationStart},
+        planner::ROWID_STRS,
+    },
     vdbe::{
         builder::{CursorType, QueryMode},
         insn::{CmpInsFlags, Insn, SubprogramRef},
@@ -1300,12 +1304,13 @@ fn emit_fk_action_subprogram(
     ctx: &FkActionContext,
     description: &'static str,
 ) -> Result<()> {
-    match connection.start_fk_action_compilation(compile_key)? {
+    match resolver.start_fk_action_compilation(compile_key)? {
         FkCompilationStart::CycleDetected(backpatch) => {
-            // Cycle detection stops recursive compilation, but we still need a
-            // real Program edge in bytecode so execution can recurse through
-            // the FK action graph later. Emit a backpatch reference now and
-            // fill it once the in-flight subprogram is fully built.
+            // The prepare-scoped compile context stops infinite recursive code
+            // generation here, but execution still needs a real Program edge
+            // so the runtime scheduler can recurse through the FK action graph
+            // later. Emit a backpatch reference now and fill it once the
+            // in-flight subprogram is fully built.
             let params = build_fk_action_params(ctx);
             let ignore_jump_target = program.allocate_label();
             program.emit_insn(Insn::Program {
@@ -1338,7 +1343,7 @@ fn emit_fk_action_subprogram(
         subprogram_builder.build(connection.clone(), true, description)
     })();
 
-    let backpatch = connection.end_fk_action_compilation(compile_key);
+    let backpatch = resolver.end_fk_action_compilation(compile_key);
 
     let built_subprogram = build_subprogram_result?;
 

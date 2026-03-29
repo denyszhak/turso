@@ -3,17 +3,19 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) type SubprogramBackpatch = Arc<std::sync::OnceLock<std::sync::Weak<PreparedProgram>>>;
+
 /// A reference to a compiled subprogram used in `Insn::Program`.
 ///
 /// `Ready` is the normal case where the subprogram is available at compile time.
-/// `Backpatch` is used for recursive FK action graphs. The handle is patched
-/// after the target subprogram finishes building and survives into runtime so
-/// recursive `Program` edges can still be resolved after compilation ends. It
-/// resolves through a `Weak` reference so cycles do not create `Arc` leaks.
+/// `Backpatch` is used for recursive FK action graphs discovered during a
+/// single prepare pass. Translation emits a prepare-scoped handle first, then
+/// fills it once the target subprogram finishes building. It resolves through a
+/// `Weak` reference so cycles do not create `Arc` leaks.
 #[derive(Debug, Clone)]
 pub enum SubprogramRef {
     Ready(Arc<PreparedProgram>),
-    Backpatch(crate::connection::SubprogramBackpatch),
+    Backpatch(SubprogramBackpatch),
 }
 
 impl SubprogramRef {

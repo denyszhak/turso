@@ -877,9 +877,10 @@ pub struct Program {
 ///
 /// # Adding New Fields
 ///
-/// If you add a new setting to `Connection` that affects statement compilation or execution,
-/// you MUST add a corresponding field here and update `from_connection()`. See the doc
-/// comment on `Connection` in `connection.rs` for the authoritative list of tracked fields.
+/// If you add a new setting to `Connection` that affects statement compilation
+/// or cached-program compatibility, you MUST add a corresponding field here and
+/// update `from_connection()`. See the doc comment on `Connection` in
+/// `connection.rs` for the authoritative list of tracked fields.
 ///
 /// Fields that affect compilation include (but are not limited to):
 /// - PRAGMA settings that change query semantics (foreign_keys, query_only, etc.)
@@ -900,7 +901,6 @@ pub struct PrepareContext {
     page_size: u32,
     sync_mode: SyncMode,
     data_sync_retry: bool,
-    trigger_recursion_limit: i32,
     encryption_key_set: bool,
     encryption_cipher: CipherMode,
     mvcc_checkpoint_threshold: Option<i64>,
@@ -922,7 +922,6 @@ impl PrepareContext {
             page_size: connection.get_page_size().get(),
             sync_mode: connection.get_sync_mode(),
             data_sync_retry: connection.get_data_sync_retry(),
-            trigger_recursion_limit: connection.get_trigger_recursion_limit(),
             encryption_key_set: connection.encryption_key.read().is_some(),
             encryption_cipher: connection.encryption_cipher_mode.get(),
             mvcc_checkpoint_threshold: connection

@@ -2,7 +2,7 @@ use crate::common::{limbo_exec_rows, TempDatabase};
 use anyhow::Result;
 use rusqlite::types::Value as SqlValue;
 use std::sync::Arc;
-use turso_core::{Connection, LimboError};
+use turso_core::{Connection, LimboError, Statement, StepResult};
 
 fn create_self_referencing_chain(conn: &Arc<Connection>, len: usize) -> Result<()> {
     conn.execute("PRAGMA foreign_keys=ON")?;
@@ -42,6 +42,18 @@ fn assert_trigger_recursion_error(result: Result<(), LimboError>) {
     );
 }
 
+fn step_statement_to_completion(stmt: &mut Statement) -> Result<(), LimboError> {
+    loop {
+        match stmt.step()? {
+            StepResult::Done => return Ok(()),
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Row => {}
+            StepResult::Busy => continue,
+            StepResult::Interrupt => return Err(LimboError::Interrupt),
+        }
+    }
+}
+
 #[turso_macros::test()]
 fn fk_cascade_delete_self_reference_honors_runtime_limit(tmp_db: TempDatabase) -> Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -49,6 +61,20 @@ fn fk_cascade_delete_self_reference_honors_runtime_limit(tmp_db: TempDatabase) -
     create_self_referencing_chain(&conn, 4)?;
 
     let result = conn.execute("DELETE FROM t WHERE id = 1");
+    assert_trigger_recursion_error(result);
+    assert_table_count(&conn, "t", 4);
+
+    Ok(())
+}
+
+#[turso_macros::test()]
+fn fk_cascade_prepare_is_not_limited_by_runtime_depth(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.set_trigger_recursion_limit(0);
+    create_self_referencing_chain(&conn, 4)?;
+
+    let mut stmt = conn.prepare("DELETE FROM t WHERE id = 1")?;
+    let result = step_statement_to_completion(&mut stmt);
     assert_trigger_recursion_error(result);
     assert_table_count(&conn, "t", 4);
 

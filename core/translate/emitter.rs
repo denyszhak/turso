@@ -5,6 +5,7 @@ use crate::turso_assert;
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use turso_macros::match_ignore_ascii_case;
 
@@ -41,6 +42,7 @@ use crate::translate::expr::{
     translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
     ReturningBufferCtx, WalkControl,
 };
+use crate::translate::fk_compile::{FkActionCompileKey, FkCompilationStart, FkCompileContext};
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     emit_guarded_fk_decrement, fire_fk_update_actions, fire_prepared_fk_delete_actions,
@@ -116,6 +118,7 @@ pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    fk_compile_ctx: &'a RefCell<FkCompileContext>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
@@ -136,12 +139,14 @@ impl<'a> Resolver<'a> {
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        fk_compile_ctx: &'a RefCell<FkCompileContext>,
         symbol_table: &'a SymbolTable,
     ) -> Self {
         Self {
             schema,
             database_schemas,
             attached_databases,
+            fk_compile_ctx,
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -158,6 +163,7 @@ impl<'a> Resolver<'a> {
             schema: self.schema,
             database_schemas: self.database_schemas,
             attached_databases: self.attached_databases,
+            fk_compile_ctx: self.fk_compile_ctx,
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -177,6 +183,24 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn enable_expr_to_reg_cache(&mut self) {
         self.expr_to_reg_cache_enabled = true;
+    }
+
+    pub(crate) fn start_fk_action_compilation(
+        &self,
+        key: FkActionCompileKey,
+    ) -> Result<FkCompilationStart> {
+        self.fk_compile_ctx
+            .borrow_mut()
+            .start_action_compilation(key)
+    }
+
+    pub(crate) fn end_fk_action_compilation(
+        &self,
+        expected_key: FkActionCompileKey,
+    ) -> crate::vdbe::insn::SubprogramBackpatch {
+        self.fk_compile_ctx
+            .borrow_mut()
+            .end_action_compilation(expected_key)
     }
 
     /// Returns the register for a previously translated expression, if caching is enabled.

@@ -44,42 +44,14 @@ pub(crate) enum TransactionState {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FkActionCompileKey {
-    DeleteCascade(usize),
-    DeleteSetNull(usize),
-    DeleteSetDefault(usize),
-    UpdateCascade(usize),
-    UpdateSetNull(usize),
-    UpdateSetDefault(usize),
-}
-
-/// A backpatch handle that will be filled with a `Weak` reference once the
-/// referenced FK action subprogram finishes building.
-pub(crate) type SubprogramBackpatch =
-    Arc<std::sync::OnceLock<std::sync::Weak<crate::PreparedProgram>>>;
-
-#[derive(Debug)]
-pub(crate) struct FkActionCompileFrame {
-    key: FkActionCompileKey,
-    backpatch: SubprogramBackpatch,
-}
-
-/// Result of `start_fk_action_compilation`.
-pub(crate) enum FkCompilationStart {
-    /// No cycle — proceed with normal compilation.
-    Proceed,
-    /// Cycle detected — use the active compile frame's backpatch handle for the Program opcode.
-    CycleDetected(SubprogramBackpatch),
-}
-
 /// Database connection handle.
 ///
 /// # Compile-Affecting Fields
 ///
-/// The following fields affect SQL statement compilation and are tracked by `PrepareContext`
-/// in `vdbe/mod.rs`. If you add a new field that affects how statements are compiled or
-/// executed, you MUST also update `PrepareContext::from_connection()` to include it
+/// The following fields affect SQL statement compilation or prepared-statement
+/// cache compatibility and are tracked by `PrepareContext` in `vdbe/mod.rs`.
+/// If you add a new field that changes compiled bytecode or the compatibility of
+/// a cached program, you MUST also update `PrepareContext::from_connection()`
 /// in core/vdbe/mod.rs.
 /// Failure to do so will cause stale cached statements to be used incorrectly.
 ///
@@ -95,7 +67,6 @@ pub(crate) enum FkCompilationStart {
 /// - `page_size`
 /// - `sync_mode`
 /// - `data_sync_retry`
-/// - `trigger_recursion_limit`
 /// - `encryption_key` (whether set)
 /// - `encryption_cipher_mode`
 /// - Pager's `spill_enabled` setting
@@ -154,12 +125,6 @@ pub struct Connection {
     pub(super) executing_subprogram_depth: AtomicI32,
     /// Per-connection recursion limit for trigger/FK subprogram calls.
     pub(super) trigger_recursion_limit: AtomicI32,
-    /// Stack of FK action subprograms currently being compiled.
-    /// Each frame carries the backpatch handle that cycle edges should use.
-    pub(super) compiling_fk_actions: RwLock<Vec<FkActionCompileFrame>>,
-    /// Current FK action subprogram compilation depth.
-    /// Self-referential and cyclic CASCADE actions recursively compile nested subprograms.
-    pub(super) compiling_fk_actions_depth: AtomicI32,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -240,8 +205,10 @@ impl Connection {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
     }
 
-    /// Hard recursion limit for trigger/FK subprogram nesting.
-    /// FK action compilation and Program execution both enforce this limit.
+    /// Hard user-visible recursion limit for nested trigger/FK execution.
+    ///
+    /// This only applies while `Program` opcodes are running. FK action
+    /// compilation uses a separate prepare-scoped safety guard.
     pub const MAX_TRIGGER_RECURSION_DEPTH: i32 = 1000;
 
     #[inline]
@@ -258,68 +225,6 @@ impl Connection {
             limit.clamp(0, Self::MAX_TRIGGER_RECURSION_DEPTH),
             Ordering::SeqCst,
         );
-    }
-
-    /// Track recursive FK action compilation so we can stop rebuilding the same
-    /// subprogram graph and instead emit a backpatch edge. This currently
-    /// reuses the user-visible trigger depth limit as a conservative compiler
-    /// guard; execution depth is enforced separately in `start_subprogram_execution`.
-    pub(crate) fn start_fk_action_compilation(
-        &self,
-        key: FkActionCompileKey,
-    ) -> Result<FkCompilationStart> {
-        let depth = self
-            .compiling_fk_actions_depth
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
-        let limit = self.get_trigger_recursion_limit();
-
-        if depth > limit {
-            self.compiling_fk_actions_depth
-                .fetch_sub(1, Ordering::SeqCst);
-            return Err(LimboError::TooManyLevelsOfTriggerRecursion);
-        }
-
-        let mut compiling_fk_actions = self.compiling_fk_actions.write();
-        if let Some(active) = compiling_fk_actions
-            .iter()
-            .rev()
-            .find(|active| active.key == key)
-        {
-            self.compiling_fk_actions_depth
-                .fetch_sub(1, Ordering::SeqCst);
-            return Ok(FkCompilationStart::CycleDetected(active.backpatch.clone()));
-        }
-        compiling_fk_actions.push(FkActionCompileFrame {
-            key,
-            backpatch: Arc::new(std::sync::OnceLock::new()),
-        });
-
-        Ok(FkCompilationStart::Proceed)
-    }
-
-    pub(crate) fn end_fk_action_compilation(
-        &self,
-        expected_key: FkActionCompileKey,
-    ) -> SubprogramBackpatch {
-        let popped = self.compiling_fk_actions.write().pop();
-        debug_assert_eq!(
-            popped.as_ref().map(|frame| frame.key),
-            Some(expected_key),
-            "fk action compilation stack out of sync"
-        );
-
-        let prev = self
-            .compiling_fk_actions_depth
-            .fetch_sub(1, Ordering::SeqCst);
-
-        debug_assert!(
-            prev > 0,
-            "end_fk_action_compilation called without matching start"
-        );
-        popped
-            .expect("fk action compilation stack out of sync")
-            .backpatch
     }
 
     /// Enforce the user-visible trigger/FK execution depth limit while nested

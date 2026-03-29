@@ -202,12 +202,8 @@ pub enum StepResult {
 }
 
 #[derive(Debug)]
-pub(crate) enum ProgramStepResult {
-    Done,
-    IO,
-    Row,
-    Interrupt,
-    Busy,
+pub(crate) enum FrameStepResult {
+    Statement(StepResult),
     SpawnedSubprogram(Box<crate::Statement>),
 }
 
@@ -979,7 +975,7 @@ impl Program {
         pager: Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
-    ) -> Result<ProgramStepResult> {
+    ) -> Result<FrameStepResult> {
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, pager, waker),
@@ -987,10 +983,10 @@ impl Program {
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
         };
         match &result {
-            Ok(ProgramStepResult::Done) => {
+            Ok(FrameStepResult::Statement(StepResult::Done)) => {
                 state.execution_state = ProgramExecutionState::Done;
             }
-            Ok(ProgramStepResult::Interrupt) => {
+            Ok(FrameStepResult::Statement(StepResult::Interrupt)) => {
                 state.execution_state = ProgramExecutionState::Interrupted;
             }
             Err(_) => {
@@ -1001,11 +997,7 @@ impl Program {
         result
     }
 
-    fn explain_step(
-        &self,
-        state: &mut ProgramState,
-        pager: Arc<Pager>,
-    ) -> Result<ProgramStepResult> {
+    fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<FrameStepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             let tx_state = self.connection.get_tx_state();
@@ -1016,7 +1008,7 @@ impl Program {
         }
 
         if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-            return Ok(ProgramStepResult::Interrupt);
+            return Ok(FrameStepResult::Statement(StepResult::Interrupt));
         }
 
         state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
@@ -1038,7 +1030,7 @@ impl Program {
                 state.pc = 0;
             } else {
                 explain_state.current = None;
-                return Ok(ProgramStepResult::Done);
+                return Ok(FrameStepResult::Statement(StepResult::Done));
             }
         }
 
@@ -1097,14 +1089,14 @@ impl Program {
             count: EXPLAIN_COLUMNS.len(),
         });
         state.pc += 1;
-        Ok(ProgramStepResult::Row)
+        Ok(FrameStepResult::Statement(StepResult::Row))
     }
 
     fn explain_query_plan_step(
         &self,
         state: &mut ProgramState,
         pager: Arc<Pager>,
-    ) -> Result<ProgramStepResult> {
+    ) -> Result<FrameStepResult> {
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
@@ -1117,14 +1109,14 @@ impl Program {
             }
 
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-                return Ok(ProgramStepResult::Interrupt);
+                return Ok(FrameStepResult::Statement(StepResult::Interrupt));
             }
 
             // FIXME: do we need this?
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
             if state.pc as usize >= self.insns.len() {
-                return Ok(ProgramStepResult::Done);
+                return Ok(FrameStepResult::Statement(StepResult::Done));
             }
 
             let Insn::Explain { p1, p2, detail } = &self.insns[state.pc as usize].0 else {
@@ -1142,7 +1134,7 @@ impl Program {
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
             });
             state.pc += 1;
-            return Ok(ProgramStepResult::Row);
+            return Ok(FrameStepResult::Statement(StepResult::Row));
         }
     }
 
@@ -1152,7 +1144,7 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
         waker: Option<&Waker>,
-    ) -> Result<ProgramStepResult> {
+    ) -> Result<FrameStepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
             if self.connection.is_closed() {
@@ -1165,13 +1157,13 @@ impl Program {
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 self.abort(&pager, None, state)?;
-                return Ok(ProgramStepResult::Interrupt);
+                return Ok(FrameStepResult::Statement(StepResult::Interrupt));
             }
 
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
                     io.set_waker(waker);
-                    return Ok(ProgramStepResult::IO);
+                    return Ok(FrameStepResult::Statement(StepResult::IO));
                 }
                 if let Some(err) = io.get_error() {
                     if pager.is_checkpointing() {
@@ -1216,7 +1208,7 @@ impl Program {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     state.auto_txn_cleanup = TxnCleanup::None;
-                    return Ok(ProgramStepResult::Done);
+                    return Ok(FrameStepResult::Statement(StepResult::Done));
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
@@ -1228,26 +1220,26 @@ impl Program {
                         // contended lock). Don't store in io_completions —
                         // yields aren't pending I/O, so the instruction will
                         // simply re-execute on the next step.
-                        return Ok(ProgramStepResult::IO);
+                        return Ok(FrameStepResult::Statement(StepResult::IO));
                     }
                     let finished = io.finished();
                     state.io_completions = Some(io);
                     if !finished {
-                        return Ok(ProgramStepResult::IO);
+                        return Ok(FrameStepResult::Statement(StepResult::IO));
                     }
                     // just continue the outer loop if IO is finished so db will continue execution immediately
                 }
                 Ok(InsnFunctionStepResult::SpawnedSubprogram(statement)) => {
-                    return Ok(ProgramStepResult::SpawnedSubprogram(statement));
+                    return Ok(FrameStepResult::SpawnedSubprogram(statement));
                 }
                 Ok(InsnFunctionStepResult::Row) => {
                     // Instruction completed (ResultRow already incremented PC)
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    return Ok(ProgramStepResult::Row);
+                    return Ok(FrameStepResult::Statement(StepResult::Row));
                 }
                 Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
-                    return Ok(ProgramStepResult::Busy);
+                    return Ok(FrameStepResult::Statement(StepResult::Busy));
                 }
                 Err(LimboError::BusySnapshot)
                     if self.connection.transaction_state.get() == TransactionState::None =>
@@ -1256,7 +1248,7 @@ impl Program {
                     // because the snapshot will continue to be stale no matter how many times we retry.
                     // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
                     // back, so auto-retrying can be useful.
-                    return Ok(ProgramStepResult::Busy);
+                    return Ok(FrameStepResult::Statement(StepResult::Busy));
                 }
                 Err(err) => {
                     if let Err(abort_err) = self.abort(&pager, Some(&err), state) {

@@ -28,7 +28,7 @@ use crate::{
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
-type ProgramStepResult = vdbe::ProgramStepResult;
+type FrameStepResult = vdbe::FrameStepResult;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
 
@@ -135,7 +135,7 @@ impl Statement {
         }
     }
 
-    fn step_single_frame(&mut self, waker: Option<&Waker>) -> Result<ProgramStepResult> {
+    fn step_single_frame(&mut self, waker: Option<&Waker>) -> Result<FrameStepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
                 .program
@@ -151,7 +151,7 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                return Ok(ProgramStepResult::IO);
+                return Ok(FrameStepResult::Statement(StepResult::IO));
             }
         }
 
@@ -172,7 +172,7 @@ impl Statement {
         }
 
         // Aggregate metrics when statement completes
-        if matches!(res, Ok(ProgramStepResult::Done)) {
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Done))) {
             let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
@@ -189,7 +189,7 @@ impl Statement {
         }
 
         // Handle busy result by invoking the busy handler
-        if matches!(res, Ok(ProgramStepResult::Busy)) {
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Busy))) {
             let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
 
@@ -204,7 +204,7 @@ impl Statement {
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
-                res = Ok(ProgramStepResult::IO);
+                res = Ok(FrameStepResult::Statement(StepResult::IO));
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
@@ -213,7 +213,7 @@ impl Statement {
 
         // Track when a write statement yields its first Row. With ephemeral-buffered
         // RETURNING, this proves all DML completed — only the scan-back remains.
-        if matches!(res, Ok(ProgramStepResult::Row))
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Row)))
             && self.query_mode == QueryMode::Normal
             && self.program.change_cnt_on
             && !self.program.result_columns.is_empty()
@@ -224,7 +224,7 @@ impl Statement {
         res
     }
 
-    fn step_current_frame(&mut self, waker: Option<&Waker>) -> Result<ProgramStepResult> {
+    fn step_current_frame(&mut self, waker: Option<&Waker>) -> Result<FrameStepResult> {
         if let Some(frame) = self.subprogram_stack.last_mut() {
             frame.step_single_frame(waker)
         } else {
@@ -248,7 +248,7 @@ impl Statement {
         loop {
             let is_nested = !self.subprogram_stack.is_empty();
             let result = match self.step_current_frame(waker) {
-                Ok(ProgramStepResult::SpawnedSubprogram(statement)) => {
+                Ok(FrameStepResult::SpawnedSubprogram(statement)) => {
                     self.subprogram_stack.push(statement);
                     continue;
                 }
@@ -257,12 +257,8 @@ impl Statement {
 
             if !is_nested {
                 return match result {
-                    Ok(ProgramStepResult::Done) => Ok(StepResult::Done),
-                    Ok(ProgramStepResult::IO) => Ok(StepResult::IO),
-                    Ok(ProgramStepResult::Row) => Ok(StepResult::Row),
-                    Ok(ProgramStepResult::Interrupt) => Ok(StepResult::Interrupt),
-                    Ok(ProgramStepResult::Busy) => Ok(StepResult::Busy),
-                    Ok(ProgramStepResult::SpawnedSubprogram(_)) => {
+                    Ok(FrameStepResult::Statement(result)) => Ok(result),
+                    Ok(FrameStepResult::SpawnedSubprogram(_)) => {
                         unreachable!("root subprogram spawn should have continued already")
                     }
                     Err(err) => Err(err),
@@ -270,7 +266,7 @@ impl Statement {
             }
 
             match result {
-                Ok(ProgramStepResult::Done) => {
+                Ok(FrameStepResult::Statement(StepResult::Done)) => {
                     let finished =
                         self.finish_current_subprogram(vdbe::execute::SubprogramOutcome::Done);
                     debug_assert!(
@@ -279,12 +275,12 @@ impl Statement {
                     );
                     continue;
                 }
-                Ok(ProgramStepResult::Row) => continue,
-                Ok(ProgramStepResult::IO) => {
+                Ok(FrameStepResult::Statement(StepResult::Row)) => continue,
+                Ok(FrameStepResult::Statement(StepResult::IO)) => {
                     self.busy = true;
                     return Ok(StepResult::IO);
                 }
-                Ok(ProgramStepResult::Busy | ProgramStepResult::Interrupt) => {
+                Ok(FrameStepResult::Statement(StepResult::Busy | StepResult::Interrupt)) => {
                     self.busy = true;
                     return Ok(StepResult::Busy);
                 }
@@ -297,7 +293,7 @@ impl Statement {
                     );
                     continue;
                 }
-                Ok(ProgramStepResult::SpawnedSubprogram(_)) => continue,
+                Ok(FrameStepResult::SpawnedSubprogram(_)) => continue,
             }
         }
     }

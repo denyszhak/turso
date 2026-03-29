@@ -170,7 +170,7 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Step,
-    SpawnedSubprogram,
+    SpawnedSubprogram(Box<Statement>),
 }
 
 impl<T> From<IOResult<T>> for InsnFunctionStepResult {
@@ -2885,7 +2885,6 @@ pub(crate) enum OpProgramState {
     /// Running state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
     Running {
         is_trigger: bool,
-        statement: Box<Statement>,
         execution_guard: SubprogramExecutionGuard,
     },
     /// Finished state retains the recursion guard until the parent consumes the
@@ -3017,19 +3016,18 @@ pub fn op_program(
 
             state.op_program_state = OpProgramState::Running {
                 is_trigger,
-                statement: Box::new(statement),
                 execution_guard,
             };
-            Ok(InsnFunctionStepResult::SpawnedSubprogram)
+            Ok(InsnFunctionStepResult::SpawnedSubprogram(Box::new(
+                statement,
+            )))
         }
         OpProgramState::Running {
             is_trigger,
-            statement,
             execution_guard,
         } => {
             state.op_program_state = OpProgramState::Running {
                 is_trigger,
-                statement,
                 execution_guard,
             };
             Err(LimboError::InternalError(
@@ -11635,7 +11633,7 @@ pub fn op_vacuum_into(
         Ok(
             InsnFunctionStepResult::Done
             | InsnFunctionStepResult::Row
-            | InsnFunctionStepResult::SpawnedSubprogram,
+            | InsnFunctionStepResult::SpawnedSubprogram(_),
         ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }

@@ -208,7 +208,7 @@ pub(crate) enum ProgramStepResult {
     Row,
     Interrupt,
     Busy,
-    SpawnedSubprogram,
+    SpawnedSubprogram(Box<crate::Statement>),
 }
 
 #[derive(Debug)]
@@ -527,13 +527,6 @@ impl ProgramState {
 
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         self.parameters.get(&index).cloned().unwrap_or(Value::Null)
-    }
-
-    pub(crate) fn active_subprogram_mut(&mut self) -> Option<&mut crate::Statement> {
-        match &mut self.op_program_state {
-            OpProgramState::Running { statement, .. } => Some(statement.as_mut()),
-            OpProgramState::Start | OpProgramState::Finished { .. } => None,
-        }
     }
 
     pub(crate) fn finish_active_subprogram(&mut self, outcome: SubprogramOutcome) -> bool {
@@ -1244,8 +1237,8 @@ impl Program {
                     }
                     // just continue the outer loop if IO is finished so db will continue execution immediately
                 }
-                Ok(InsnFunctionStepResult::SpawnedSubprogram) => {
-                    return Ok(ProgramStepResult::SpawnedSubprogram);
+                Ok(InsnFunctionStepResult::SpawnedSubprogram(statement)) => {
+                    return Ok(ProgramStepResult::SpawnedSubprogram(statement));
                 }
                 Ok(InsnFunctionStepResult::Row) => {
                     // Instruction completed (ResultRow already incremented PC)

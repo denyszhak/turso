@@ -4556,6 +4556,13 @@ pub fn op_program(
     let subprogram = subprogram.prepared_program()?;
     match std::mem::take(state.active_op_state.program()) {
         OpProgramState::Start => {
+            // Bound nested trigger/FK-action depth, like SQLite's OP_Program
+            // checks nFrame against SQLITE_LIMIT_TRIGGER_DEPTH.
+            let depth_limit = program.connection.limit_trigger_depth();
+            if state.subprogram_depth >= depth_limit as usize {
+                return Err(LimboError::TooManyLevelsOfTriggerRecursion);
+            }
+
             // Try to reuse a cached statement for this PC, otherwise create a new one.
             // When we have triggers or fk-actions with multi-row inserts, we can re-use
             // cached statements by storing them key'd by the state.pc if we are in a loop
@@ -4574,6 +4581,7 @@ pub fn op_program(
                         false,
                     ))
                 };
+            statement.set_subprogram_depth(state.subprogram_depth + 1);
 
             // Check if this is a trigger subprogram - if so, track execution
             // and save last_insert_rowid so it can be restored after the trigger finishes.

@@ -380,6 +380,10 @@ impl Statement {
         }
     }
 
+    pub(crate) fn set_subprogram_depth(&mut self, depth: usize) {
+        self.state.subprogram_depth = depth;
+    }
+
     /// Detach nested subprogram statements so chains can be torn down
     /// iteratively; recursive drops overflow the stack on deep cascades.
     #[allow(clippy::vec_box)]

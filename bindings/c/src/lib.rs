@@ -88,6 +88,8 @@ pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;
 pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
 
+pub const SQLITE_LIMIT_TRIGGER_DEPTH: ffi::c_int = 10;
+
 pub const SQLITE_INTEGER: ffi::c_int = 1;
 pub const SQLITE_FLOAT: ffi::c_int = 2;
 pub const SQLITE_TEXT: ffi::c_int = 3;
@@ -1416,13 +1418,32 @@ pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
     stub!();
 }
 
+/// Query or change a per-connection limit. Returns the prior value, or -1
+/// for an unrecognized limit id; a negative `new_value` only queries.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_limit(
-    _db: *mut sqlite3,
-    _id: ffi::c_int,
-    _new_value: ffi::c_int,
+    db: *mut sqlite3,
+    id: ffi::c_int,
+    new_value: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    if db.is_null() {
+        return -1;
+    }
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return -1,
+    };
+    match id {
+        SQLITE_LIMIT_TRIGGER_DEPTH => {
+            let previous = inner.conn.limit_trigger_depth();
+            if new_value >= 0 {
+                inner.conn.set_limit_trigger_depth(new_value);
+            }
+            previous
+        }
+        _ => -1,
+    }
 }
 
 #[no_mangle]
@@ -3085,6 +3106,41 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
 mod tests {
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn test_sqlite3_limit_trigger_depth_roundtrip_and_clamp() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let max_depth = turso_core::Connection::MAX_TRIGGER_DEPTH;
+            // Negative new_value queries without changing.
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, -1), max_depth);
+
+            // Setting returns the prior value.
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, 3), max_depth);
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, -1), 3);
+
+            // Values above the hard maximum clamp to it.
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, i32::MAX), 3);
+            assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, -1), max_depth);
+
+            // Unknown limit ids report failure.
+            assert_eq!(sqlite3_limit(db, -12345, -1), -1);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_limit_null_db_returns_error() {
+        unsafe {
+            assert_eq!(
+                sqlite3_limit(ptr::null_mut(), SQLITE_LIMIT_TRIGGER_DEPTH, -1),
+                -1
+            );
+        }
+    }
 
     #[test]
     fn test_sqlite3_stmt_status_rows_read_written() {

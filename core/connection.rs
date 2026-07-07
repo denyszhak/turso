@@ -440,6 +440,9 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    /// Maximum trigger/FK-action nesting depth, i.e.
+    /// `sqlite3_limit(SQLITE_LIMIT_TRIGGER_DEPTH)`.
+    pub(super) limit_trigger_depth: AtomicI32,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -852,6 +855,20 @@ impl Connection {
             self.executing_triggers.read().last().map(|t| &t.name)
         );
         self.executing_triggers.write().pop();
+    }
+
+    /// Hard upper bound for [`Self::limit_trigger_depth`], matching SQLite's
+    /// default `SQLITE_MAX_TRIGGER_DEPTH`.
+    pub const MAX_TRIGGER_DEPTH: i32 = 1000;
+
+    pub fn limit_trigger_depth(&self) -> i32 {
+        self.limit_trigger_depth.load(Ordering::SeqCst)
+    }
+
+    /// Clamped to `0..=MAX_TRIGGER_DEPTH`, like `sqlite3_limit`.
+    pub fn set_limit_trigger_depth(&self, limit: i32) {
+        self.limit_trigger_depth
+            .store(limit.clamp(0, Self::MAX_TRIGGER_DEPTH), Ordering::SeqCst);
     }
 
     fn should_retry_cross_process_schema_lookup(

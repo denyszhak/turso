@@ -67,6 +67,8 @@ pub enum LimboError {
     Busy,
     #[error("interrupt")]
     Interrupt,
+    #[error("too many levels of trigger recursion")]
+    TooManyLevelsOfTriggerRecursion,
     #[error("Database snapshot is stale. You must rollback and retry the whole transaction.")]
     BusySnapshot,
     #[error("Conflict: {0}")]

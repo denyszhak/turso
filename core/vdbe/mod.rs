@@ -773,6 +773,9 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// How many trigger/FK-action frames sit above this program (root = 0).
+    /// Checked by `op_program` against the connection's trigger depth limit.
+    pub(crate) subprogram_depth: usize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
@@ -859,6 +862,7 @@ impl ProgramState {
             pending_fail_error: None,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            subprogram_depth: 0,
         }
     }
 

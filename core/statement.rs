@@ -28,6 +28,7 @@ use crate::{
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
+type FrameStepResult = vdbe::FrameStepResult;
 type ProgramExecutionState = vdbe::ProgramExecutionState;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
@@ -315,6 +316,11 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// Nested trigger/FK-action subprogram frames, deepest last. Frames run
+    /// here instead of recursing through op_program, so cascade depth is
+    /// bounded by the trigger depth limit, not the Rust call stack (#5154).
+    #[allow(clippy::vec_box)]
+    subprogram_stack: Vec<Box<Statement>>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -370,7 +376,17 @@ impl Statement {
             origin,
             counted_as_active_root: false,
             nested_guard_active,
+            subprogram_stack: Vec::new(),
         }
+    }
+
+    /// Detach nested subprogram statements so chains can be torn down
+    /// iteratively; recursive drops overflow the stack on deep cascades.
+    #[allow(clippy::vec_box)]
+    pub(crate) fn take_nested_statements(&mut self) -> Vec<Box<Statement>> {
+        let mut nested: Vec<Box<Statement>> = self.subprogram_stack.drain(..).collect();
+        nested.append(&mut self.state.take_nested_statements());
+        nested
     }
 
     pub fn tail_offset(&self) -> usize {
@@ -429,7 +445,11 @@ impl Statement {
     /// Statement metrics accumulated across executions of this prepared
     /// statement. Includes subprogram work.
     pub fn metrics(&self) -> vdbe::metrics::StatementMetrics {
-        self.state.metrics()
+        let mut metrics = self.state.metrics();
+        for frame in &self.subprogram_stack {
+            metrics.merge(&frame.metrics());
+        }
+        metrics
     }
 
     pub fn reset_metrics(&mut self) {
@@ -460,6 +480,14 @@ impl Statement {
     /// Returns None if no IO is pending.
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
+        // Pending I/O belongs to the deepest subprogram frame while one exists.
+        if let Some(frame) = self.subprogram_stack.last_mut() {
+            return frame
+                .state
+                .io_completions
+                .take()
+                .or_else(|| self.state.io_completions.take());
+        }
         self.state.io_completions.take()
     }
 
@@ -541,6 +569,95 @@ impl Statement {
             }
         }
 
+        loop {
+            // Step the deepest subprogram frame first; frames run on this
+            // explicit stack instead of the Rust call stack.
+            if let Some(frame) = self.subprogram_stack.last_mut() {
+                let res =
+                    frame
+                        .program
+                        .step(&mut frame.state, &frame.pager, frame.query_mode, waker);
+                match res {
+                    Ok(FrameStepResult::SpawnedSubprogram(child)) => {
+                        self.subprogram_stack.push(child);
+                    }
+                    Ok(FrameStepResult::Statement(StepResult::Done)) => {
+                        let frame = self
+                            .subprogram_stack
+                            .pop()
+                            .expect("subprogram stack is non-empty");
+                        self.finish_subprogram_frame(frame, None);
+                    }
+                    Err(err) => {
+                        // The frame already aborted itself inside Program::step;
+                        // the spawning Program opcode decides how the error
+                        // propagates.
+                        let frame = self
+                            .subprogram_stack
+                            .pop()
+                            .expect("subprogram stack is non-empty");
+                        self.finish_subprogram_frame(frame, Some(err));
+                    }
+                    Ok(FrameStepResult::Statement(StepResult::Row)) => {
+                        // Subprogram result rows are not surfaced to the caller.
+                    }
+                    Ok(FrameStepResult::Statement(step @ (StepResult::IO | StepResult::Yield))) => {
+                        self.busy = true;
+                        return Ok(step);
+                    }
+                    Ok(FrameStepResult::Statement(StepResult::Busy | StepResult::Interrupt)) => {
+                        // Nested busy/interrupt surfaces as Busy on the root
+                        // statement, as it did when op_program stepped frames
+                        // inline.
+                        self.busy = true;
+                        return Ok(self.apply_busy_handler(waker));
+                    }
+                }
+                continue;
+            }
+
+            match self.step_root_frame(waker)? {
+                FrameStepResult::SpawnedSubprogram(frame) => {
+                    self.subprogram_stack.push(frame);
+                }
+                FrameStepResult::Statement(result) => return Ok(result),
+            }
+        }
+    }
+
+    /// Deliver a finished subprogram frame's outcome to the `Program` opcode
+    /// that spawned it: the next frame down the stack, or the root program.
+    fn finish_subprogram_frame(&mut self, frame: Box<Statement>, error: Option<LimboError>) {
+        let parent_state = match self.subprogram_stack.last_mut() {
+            Some(parent) => &mut parent.state,
+            None => &mut self.state,
+        };
+        parent_state.finish_active_subprogram(frame, error);
+    }
+
+    /// Invoke the connection's busy handler after a Busy result: IO schedules
+    /// a retry after the handler's backoff, Busy means the handler gave up.
+    fn apply_busy_handler(&mut self, waker: Option<&Waker>) -> StepResult {
+        let now = self.pager.io.current_time_monotonic();
+        let handler = self.program.connection.get_busy_handler();
+        let busy_state = self
+            .busy_handler_state
+            .get_or_insert_with(|| BusyHandlerState::new(now));
+        if busy_state.invoke(&handler, now) {
+            if let Some(waker) = waker {
+                waker.wake_by_ref();
+            }
+            #[cfg(shuttle)]
+            crate::thread::spin_loop();
+            StepResult::IO
+        } else {
+            StepResult::Busy
+        }
+    }
+
+    /// Step the root program with the ceremony subprogram frames don't get:
+    /// schema reprepare retries, completion metrics, and busy handling.
+    fn step_root_frame(&mut self, waker: Option<&Waker>) -> Result<FrameStepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
         let mut res = self
             .program
@@ -574,7 +691,7 @@ impl Statement {
         }
 
         // Aggregate metrics when statement completes
-        if matches!(res, Ok(StepResult::Done)) {
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Done))) {
             self.program
                 .connection
                 .metrics
@@ -594,31 +711,13 @@ impl Statement {
         }
 
         // Handle busy result by invoking the busy handler
-        if matches!(res, Ok(StepResult::Busy)) {
-            let now = self.pager.io.current_time_monotonic();
-            let handler = self.program.connection.get_busy_handler();
-
-            // Initialize or get existing busy handler state
-            let busy_state = self
-                .busy_handler_state
-                .get_or_insert_with(|| BusyHandlerState::new(now));
-
-            // Invoke the busy handler to determine if we should retry
-            if busy_state.invoke(&handler, now) {
-                // Handler says retry, yield with IO to wait for timeout
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
-                res = Ok(StepResult::IO);
-                #[cfg(shuttle)]
-                crate::thread::spin_loop();
-            }
-            // else: Handler says stop, res stays as Busy
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Busy))) {
+            res = Ok(FrameStepResult::Statement(self.apply_busy_handler(waker)));
         }
 
         // Track when a write statement yields its first Row. With ephemeral-buffered
         // RETURNING, this proves all DML completed — only the scan-back remains.
-        if matches!(res, Ok(StepResult::Row))
+        if matches!(res, Ok(FrameStepResult::Statement(StepResult::Row)))
             && self.query_mode == QueryMode::Normal
             && self.program.change_cnt_on
             && !self.program.result_columns.is_empty()
@@ -627,7 +726,12 @@ impl Statement {
         }
 
         if self.counted_as_active_root
-            && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
+            && (matches!(
+                res,
+                Ok(FrameStepResult::Statement(
+                    StepResult::Done | StepResult::Interrupt
+                ))
+            ) || res.is_err())
         {
             self.release_active_root_if_counted();
         }
@@ -655,15 +759,6 @@ impl Statement {
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
-    }
-
-    /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
-    /// arming, busy handler, metrics recording, and schema retry.
-    /// The parent statement handles all of those concerns.
-    #[inline]
-    pub fn step_subprogram(&mut self) -> Result<StepResult> {
-        self.program
-            .step(&mut self.state, &self.pager, self.query_mode, None)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -1320,7 +1415,7 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        while let Some(io) = self.take_io_completions() {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
@@ -1372,7 +1467,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::SpawnedSubprogram(_)) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(
@@ -1420,6 +1516,8 @@ impl Statement {
                 );
             }
         }
+        // Drop abandoned subprogram frames.
+        vdbe::drop_statement_chain(self.take_nested_statements());
         // Safety net: if end_statement wasn't reached (e.g. statement dropped
         // mid-execution), ensure n_active_writes is decremented before reset
         // clears the flag.

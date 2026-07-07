@@ -2134,3 +2134,101 @@ fn test_changes_after_foreign_key_failure_reset_to_zero(db: TempDatabase) {
     let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
     assert_eq!(total_changes, vec![(2,)]);
 }
+
+/// A constraint error inside a trigger fired by another trigger must cross
+/// both subprogram frames and abort the whole statement.
+#[turso_macros::test()]
+fn test_nested_trigger_constraint_error_propagates_to_root(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE outer_t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE inner_t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO inner_t VALUES (1)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER outer_before_insert
+         BEFORE INSERT ON outer_t
+         BEGIN
+             INSERT INTO inner_t VALUES (NEW.x);
+         END",
+    )
+    .unwrap();
+
+    let err = conn.execute("INSERT INTO outer_t VALUES (1)").unwrap_err();
+    assert!(
+        matches!(err, turso_core::LimboError::Constraint(_)),
+        "expected nested constraint error, got {err:?}"
+    );
+
+    let outer_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM outer_t ORDER BY x");
+    let inner_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM inner_t ORDER BY x");
+    assert!(outer_rows.is_empty(), "outer row should be rolled back");
+    assert_eq!(inner_rows, vec![(1,)]);
+}
+
+/// OR IGNORE swallows a constraint raised inside the trigger body.
+#[turso_macros::test()]
+fn test_nested_trigger_constraint_swallowed_by_or_ignore(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE outer_t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE inner_t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO inner_t VALUES (1)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER outer_before_insert
+         BEFORE INSERT ON outer_t
+         BEGIN
+             INSERT INTO inner_t VALUES (NEW.x);
+         END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT OR IGNORE INTO outer_t VALUES (1)")
+        .unwrap();
+
+    let outer_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM outer_t ORDER BY x");
+    let inner_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM inner_t ORDER BY x");
+    assert_eq!(outer_rows, vec![(1,)]);
+    assert_eq!(inner_rows, vec![(1,)]);
+}
+
+/// RAISE(IGNORE) in a trigger fired from another trigger's body skips only
+/// the inner row, not the outer statement's row.
+#[turso_macros::test()]
+fn test_nested_trigger_raise_ignore_skips_only_inner_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE outer_t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE inner_t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER outer_after_insert
+         AFTER INSERT ON outer_t
+         BEGIN
+             INSERT INTO inner_t VALUES (NEW.x);
+         END",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TRIGGER inner_before_insert
+         BEFORE INSERT ON inner_t
+         WHEN NEW.x = 2
+         BEGIN
+             SELECT RAISE(IGNORE);
+         END",
+    )
+    .unwrap();
+
+    conn.execute("INSERT INTO outer_t VALUES (1)").unwrap();
+    conn.execute("INSERT INTO outer_t VALUES (2)").unwrap();
+    conn.execute("INSERT INTO outer_t VALUES (3)").unwrap();
+
+    let outer_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM outer_t ORDER BY x");
+    let inner_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM inner_t ORDER BY x");
+    assert_eq!(outer_rows, vec![(1,), (2,), (3,)]);
+    assert_eq!(inner_rows, vec![(1,), (3,)]);
+}

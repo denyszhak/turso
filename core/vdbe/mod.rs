@@ -177,6 +177,25 @@ pub enum StepResult {
     Yield,
 }
 
+/// Result of stepping a single program frame. `op_program` hands spawned
+/// trigger/FK-action statements up to [`crate::Statement`], which runs them
+/// on an explicit frame stack instead of the Rust call stack (deep cascades
+/// would overflow it, #5154).
+#[derive(Debug)]
+pub(crate) enum FrameStepResult {
+    Statement(StepResult),
+    SpawnedSubprogram(Box<crate::Statement>),
+}
+
+/// Drop a chain of nested subprogram statements iteratively; recursive drops
+/// overflow the stack on deep cascades.
+#[allow(clippy::vec_box)]
+pub(crate) fn drop_statement_chain(mut nested: Vec<Box<Statement>>) {
+    while let Some(mut stmt) = nested.pop() {
+        nested.append(&mut stmt.take_nested_statements());
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 /// The commit state of the program.
@@ -897,7 +916,34 @@ impl ProgramState {
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
     }
 
+    /// Detach nested subprogram statements (per-PC cache and a `Finished`
+    /// Program opcode's statement) so callers can tear statement chains down
+    /// iteratively; recursive drops overflow the stack on deep cascades.
+    #[allow(clippy::vec_box)]
+    pub(crate) fn take_nested_statements(&mut self) -> Vec<Box<Statement>> {
+        let mut nested: Vec<Box<Statement>> = self
+            .subprogram_stmt_cache
+            .drain()
+            .map(|(_, stmt)| stmt)
+            .collect();
+        if matches!(
+            self.active_op_state.program_ref(),
+            Some(OpProgramState::Finished { .. })
+        ) {
+            let Some(slot) = self.active_op_state.program_mut() else {
+                unreachable!("program op state just matched Finished")
+            };
+            let OpProgramState::Finished { statement, .. } = std::mem::take(slot) else {
+                unreachable!("program op state just matched Finished")
+            };
+            nested.push(statement);
+        }
+        nested
+    }
+
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        drop_statement_chain(self.take_nested_statements());
+
         self.io_completions = None;
         self.pc = 0;
 
@@ -973,6 +1019,36 @@ impl ProgramState {
         self.subprogram_stmt_cache.clear();
     }
 
+    /// Transition the in-flight `Program` opcode from `Running` to `Finished`;
+    /// `op_program` consumes the outcome on this program's next step.
+    pub(crate) fn finish_active_subprogram(
+        &mut self,
+        statement: Box<Statement>,
+        error: Option<LimboError>,
+    ) {
+        let slot = self.active_op_state.program();
+        match std::mem::take(slot) {
+            OpProgramState::Running {
+                is_trigger,
+                saved_last_insert_rowid,
+                saved_changes_value,
+            } => {
+                *slot = OpProgramState::Finished {
+                    statement,
+                    error,
+                    is_trigger,
+                    saved_last_insert_rowid,
+                    saved_changes_value,
+                };
+            }
+            OpProgramState::Start | OpProgramState::Finished { .. } => {
+                unreachable!(
+                    "subprogram frame finished but the spawning Program opcode is not running"
+                )
+            }
+        }
+    }
+
     pub(crate) fn record_statement_change(&self) {
         self.n_change.fetch_add(1, Ordering::SeqCst);
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
@@ -1002,7 +1078,8 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
+        if let Some(OpProgramState::Finished { statement, .. }) = self.active_op_state.program_ref()
+        {
             metrics.merge(&statement.metrics());
         }
         for statement in self.subprogram_stmt_cache.values() {
@@ -1013,7 +1090,8 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
+        if let Some(OpProgramState::Finished { statement, .. }) = self.active_op_state.program_mut()
+        {
             statement.reset_metrics();
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
@@ -1032,7 +1110,8 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
-        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
+        if let Some(OpProgramState::Finished { statement, .. }) = self.active_op_state.program_mut()
+        {
             statement.reset_stmt_status(counter);
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
@@ -1484,24 +1563,28 @@ impl Program {
     }
 
     #[turso_macros::trace_stack]
-    pub fn step(
+    pub(crate) fn step(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> Result<FrameStepResult> {
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, pager, waker),
-            QueryMode::Explain => self.explain_step(state, pager),
-            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
+            QueryMode::Explain => self
+                .explain_step(state, pager)
+                .map(FrameStepResult::Statement),
+            QueryMode::ExplainQueryPlan => self
+                .explain_query_plan_step(state, pager)
+                .map(FrameStepResult::Statement),
         };
         match &result {
-            Ok(StepResult::Done) => {
+            Ok(FrameStepResult::Statement(StepResult::Done)) => {
                 state.execution_state = ProgramExecutionState::Done;
             }
-            Ok(StepResult::Interrupt) => {
+            Ok(FrameStepResult::Statement(StepResult::Interrupt)) => {
                 state.execution_state = ProgramExecutionState::Interrupted;
             }
             Err(_) => {
@@ -1661,7 +1744,7 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> Result<FrameStepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
             if self.connection.is_closed() {
@@ -1674,13 +1757,13 @@ impl Program {
             }
             if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 self.abort(pager, None, state)?;
-                return Ok(StepResult::Interrupt);
+                return Ok(FrameStepResult::Statement(StepResult::Interrupt));
             }
 
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
                     io.set_waker(waker);
-                    return Ok(StepResult::IO);
+                    return Ok(FrameStepResult::Statement(StepResult::IO));
                 }
                 if let Some(err) = io.get_error() {
                     if pager.is_checkpointing() {
@@ -1766,7 +1849,7 @@ impl Program {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     state.auto_txn_cleanup = TxnCleanup::None;
-                    return Ok(StepResult::Done);
+                    return Ok(FrameStepResult::Statement(StepResult::Done));
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
@@ -1778,23 +1861,27 @@ impl Program {
                         // contended lock). Don't store in io_completions —
                         // yields aren't pending I/O, so the instruction will
                         // simply re-execute on the next step.
-                        return Ok(StepResult::Yield);
+                        return Ok(FrameStepResult::Statement(StepResult::Yield));
                     }
                     let finished = io.finished();
                     state.io_completions = Some(io);
                     if !finished {
-                        return Ok(StepResult::IO);
+                        return Ok(FrameStepResult::Statement(StepResult::IO));
                     }
                     // just continue the outer loop if IO is finished so db will continue execution immediately
                 }
                 Ok(InsnFunctionStepResult::Row) => {
                     // Instruction completed (ResultRow already incremented PC)
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    return Ok(StepResult::Row);
+                    return Ok(FrameStepResult::Statement(StepResult::Row));
+                }
+                Ok(InsnFunctionStepResult::SpawnedSubprogram(statement)) => {
+                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                    return Ok(FrameStepResult::SpawnedSubprogram(statement));
                 }
                 Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
-                    return Ok(StepResult::Busy);
+                    return Ok(FrameStepResult::Statement(StepResult::Busy));
                 }
                 Err(LimboError::BusySnapshot)
                     if self.connection.transaction_state.get() == TransactionState::None =>
@@ -1803,7 +1890,7 @@ impl Program {
                     // because the snapshot will continue to be stale no matter how many times we retry.
                     // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
                     // back, so auto-retrying can be useful.
-                    return Ok(StepResult::Busy);
+                    return Ok(FrameStepResult::Statement(StepResult::Busy));
                 }
                 Err(err) => {
                     if let Err(abort_err) = self.abort(pager, Some(&err), state) {

@@ -389,6 +389,9 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Step,
+    /// A Program opcode prepared a nested trigger/FK-action statement; the
+    /// owning [`Statement`] runs it on its explicit frame stack.
+    SpawnedSubprogram(Box<Statement>),
 }
 
 impl<T> From<IOResult<T>> for InsnFunctionStepResult {
@@ -4125,6 +4128,9 @@ pub fn op_auto_commit(
     {
         res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
         res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+        InsnFunctionStepResult::SpawnedSubprogram(_) => {
+            unreachable!("commit_txn never spawns subprograms")
+        }
     };
 
     if mv_store.is_none() {
@@ -4450,16 +4456,28 @@ pub fn op_integer(
 
 pub enum OpProgramState {
     Start,
-    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
-    Step {
+    /// The subprogram statement is executing on the owning [`Statement`]'s
+    /// frame stack; the spawning program is not stepped until it finishes.
+    Running {
+        /// Whether we're executing a trigger subprogram (vs FK action subprogram)
         is_trigger: bool,
-        statement: Box<Statement>,
         /// Saved last_insert_rowid to restore after trigger subprogram completes.
         /// Per SQLite docs, trigger-body INSERTs must not overwrite the top-level rowid.
         saved_last_insert_rowid: Option<i64>,
         /// Saved connection-level `changes()` value to restore after a trigger subprogram.
         /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
         /// value becomes visible again once the trigger returns.
+        saved_changes_value: Option<i64>,
+    },
+    /// The subprogram frame completed; `op_program` consumes the outcome on
+    /// the next step.
+    Finished {
+        statement: Box<Statement>,
+        /// The error the frame finished with, if any (the frame already
+        /// aborted itself).
+        error: Option<LimboError>,
+        is_trigger: bool,
+        saved_last_insert_rowid: Option<i64>,
         saved_changes_value: Option<i64>,
     },
 }
@@ -4536,156 +4554,105 @@ pub fn op_program(
         insn
     );
     let subprogram = subprogram.prepared_program()?;
-    loop {
-        match std::mem::take(state.active_op_state.program()) {
-            OpProgramState::Start => {
-                // Try to reuse a cached statement for this PC, otherwise create a new one.
-                // When we have triggers or fk-actions with multi-row inserts, we can re-use
-                // cached statements by storing them key'd by the state.pc if we are in a loop
-                let pc_key = state.pc as usize;
-                let mut statement =
-                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
-                        cached.reset_for_subprogram_reuse();
-                        cached
-                    } else {
-                        Box::new(Statement::new_with_origin(
-                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                            pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                            false,
-                        ))
-                    };
-
-                // Check if this is a trigger subprogram - if so, track execution
-                // and save last_insert_rowid so it can be restored after the trigger finishes.
-                let (is_trigger, saved_last_insert_rowid, saved_last_changes_value) =
-                    if let Some(ref trigger) = statement.get_trigger() {
-                        program.connection.start_trigger_execution(trigger.clone());
-                        (
-                            true,
-                            Some(program.connection.last_insert_rowid()),
-                            Some(program.connection.changes()),
-                        )
-                    } else {
-                        (false, None, None)
-                    };
-
-                // Copy parameter values from parent registers into the subprogram's parameters.
-                for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
-                    let value = state.registers[parent_reg].get_value().clone();
-                    let param_index = NonZero::<usize>::new(param_idx + 1)
-                        .expect("param_idx + 1 should be non-zero");
-                    statement.bind_at(param_index, value)?;
-                }
-
-                *state.active_op_state.program() = OpProgramState::Step {
-                    is_trigger,
-                    statement,
-                    saved_last_insert_rowid,
-                    saved_changes_value: saved_last_changes_value,
+    match std::mem::take(state.active_op_state.program()) {
+        OpProgramState::Start => {
+            // Try to reuse a cached statement for this PC, otherwise create a new one.
+            // When we have triggers or fk-actions with multi-row inserts, we can re-use
+            // cached statements by storing them key'd by the state.pc if we are in a loop
+            let pc_key = state.pc as usize;
+            let mut statement =
+                if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+                    cached.reset_for_subprogram_reuse();
+                    cached
+                } else {
+                    Box::new(Statement::new_with_origin(
+                        Program::from_prepared(subprogram, program.connection.clone()),
+                        pager.clone(),
+                        QueryMode::Normal,
+                        0,
+                        crate::statement::StatementOrigin::Subprogram,
+                        false,
+                    ))
                 };
+
+            // Check if this is a trigger subprogram - if so, track execution
+            // and save last_insert_rowid so it can be restored after the trigger finishes.
+            let (is_trigger, saved_last_insert_rowid, saved_last_changes_value) =
+                if let Some(ref trigger) = statement.get_trigger() {
+                    program.connection.start_trigger_execution(trigger.clone());
+                    (
+                        true,
+                        Some(program.connection.last_insert_rowid()),
+                        Some(program.connection.changes()),
+                    )
+                } else {
+                    (false, None, None)
+                };
+
+            // Copy parameter values from parent registers into the subprogram's parameters.
+            for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
+                let value = state.registers[parent_reg].get_value().clone();
+                let param_index =
+                    NonZero::<usize>::new(param_idx + 1).expect("param_idx + 1 should be non-zero");
+                statement.bind_at(param_index, value)?;
             }
-            OpProgramState::Step {
+
+            *state.active_op_state.program() = OpProgramState::Running {
                 is_trigger,
-                mut statement,
                 saved_last_insert_rowid,
                 saved_changes_value: saved_last_changes_value,
-            } => {
-                let mut raise_ignore = false;
-                // Track whether the subprogram aborted with an error. When abort()
-                // runs inside the subprogram, it already calls end_trigger_execution(),
-                // so we must not call it again after the loop.
-                let mut subprogram_aborted = false;
-                loop {
-                    let res = statement.step_subprogram();
-                    match res {
-                        Ok(step_result) => match step_result {
-                            StepResult::Done => break,
-                            StepResult::IO | StepResult::Yield => {
-                                let io = statement.take_io_completions().unwrap_or_else(|| {
-                                    IOCompletions::Single(Completion::new_yield())
-                                });
-                                *state.active_op_state.program() = OpProgramState::Step {
-                                    is_trigger,
-                                    statement,
-                                    saved_last_insert_rowid,
-                                    saved_changes_value: saved_last_changes_value,
-                                };
-                                return Ok(InsnFunctionStepResult::IO(io));
-                            }
-                            StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
-                                *state.active_op_state.program() = OpProgramState::Step {
-                                    is_trigger,
-                                    statement,
-                                    saved_last_insert_rowid,
-                                    saved_changes_value: saved_last_changes_value,
-                                };
-                                return Err(LimboError::Busy);
-                            }
-                        },
-                        Err(LimboError::Constraint(constraint_err)) => {
-                            if program.resolve_type != ResolveType::Ignore {
-                                subprogram_aborted = true;
-                                finish_subprogram(
-                                    program,
-                                    &statement,
-                                    is_trigger,
-                                    subprogram_aborted,
-                                    saved_last_insert_rowid,
-                                    saved_last_changes_value,
-                                );
-                                return Err(LimboError::Constraint(constraint_err));
-                            }
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(LimboError::RaiseIgnore) => {
-                            raise_ignore = true;
-                            subprogram_aborted = true;
-                            break;
-                        }
-                        Err(err) => {
-                            subprogram_aborted = true;
-                            finish_subprogram(
-                                program,
-                                &statement,
-                                is_trigger,
-                                subprogram_aborted,
-                                saved_last_insert_rowid,
-                                saved_last_changes_value,
-                            );
-                            return Err(err);
-                        }
-                    }
-                }
-                finish_subprogram(
-                    program,
-                    &statement,
-                    is_trigger,
-                    subprogram_aborted,
-                    saved_last_insert_rowid,
-                    saved_last_changes_value,
-                );
+            };
+            Ok(InsnFunctionStepResult::SpawnedSubprogram(statement))
+        }
+        OpProgramState::Running { .. } => Err(LimboError::InternalError(
+            "Program opcode stepped while its subprogram frame is still executing".to_string(),
+        )),
+        OpProgramState::Finished {
+            statement,
+            error,
+            is_trigger,
+            saved_last_insert_rowid,
+            saved_changes_value: saved_last_changes_value,
+        } => {
+            // On error the frame's abort() already called
+            // end_trigger_execution(); finish_subprogram must not repeat it.
+            let subprogram_aborted = error.is_some();
+            finish_subprogram(
+                program,
+                &statement,
+                is_trigger,
+                subprogram_aborted,
+                saved_last_insert_rowid,
+                saved_last_changes_value,
+            );
 
-                // Cache the statement for reuse on subsequent fires of this
-                // same Program instruction (e.g. next row in an INSERT loop).
-                // Only cache on clean completion - aborted statements have dirty
-                // internal state and cannot be safely reused.
-                if !subprogram_aborted {
+            match error {
+                None => {
+                    // Cache the statement for reuse on subsequent fires of this
+                    // same Program instruction (e.g. next row in an INSERT loop).
+                    // Only cache on clean completion - aborted statements have dirty
+                    // internal state and cannot be safely reused.
                     let pc_key = state.pc as usize;
                     state.subprogram_stmt_cache.insert(pc_key, statement);
+                    state.pc += 1;
+                    state.active_op_state.clear();
+                    Ok(InsnFunctionStepResult::Step)
                 }
-                if raise_ignore {
+                Some(LimboError::Constraint(constraint_err)) => {
+                    if program.resolve_type != ResolveType::Ignore {
+                        return Err(LimboError::Constraint(constraint_err));
+                    }
+                    state.pc += 1;
+                    state.active_op_state.clear();
+                    Ok(InsnFunctionStepResult::Step)
+                }
+                Some(LimboError::RaiseIgnore) => {
                     // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
                     state.pc = ignore_jump_target.as_offset_int();
-                } else {
-                    state.pc += 1;
+                    state.active_op_state.clear();
+                    Ok(InsnFunctionStepResult::Step)
                 }
-                state.active_op_state.clear();
-                return Ok(InsnFunctionStepResult::Step);
+                Some(err) => Err(err),
             }
         }
     }
@@ -16345,7 +16312,11 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO(io))
         }
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+        Ok(
+            InsnFunctionStepResult::Done
+            | InsnFunctionStepResult::Row
+            | InsnFunctionStepResult::SpawnedSubprogram(_),
+        ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
